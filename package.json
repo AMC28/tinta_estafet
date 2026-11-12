@@ -1,0 +1,10 @@
+{
+  "name": "tinta-estafet",
+  "version": "1.0.0-prototype",
+  "description": "Tinta Estafet - Web-based Multiplayer Drawing Relay Party Game",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  }
+}

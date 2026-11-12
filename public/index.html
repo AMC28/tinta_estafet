@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Tinta Estafet — Multiplayer Drawing Relay Party Game</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Topbar -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-logo">🎨</div>
+        <div>
+          <div class="brand-title">Tinta Estafet</div>
+          <div class="brand-sub">Multiplayer Drawing Relay Party Game</div>
+        </div>
+      </div>
+
+      <div class="status-pills">
+        <span id="roundPill" class="pill">Ronde 1</span>
+        <span id="phasePill" class="pill phase-pill">Fase: LOBBY</span>
+        <span id="rolePill" class="pill hidden"></span>
+        <button id="returnLobbyTopBtn" class="btn btn-rose btn-sm hidden" title="Hentikan ronde saat ini dan kembalikan semua peserta ke Lobby">🔙 Kembalikan Semua ke Lobby</button>
+        <button id="switchRoleBtn" class="btn btn-outline btn-sm hidden" title="Keluar / Ganti Peran">Ganti Peran</button>
+      </div>
+    </header>
+
+    <!-- Main Dynamic Container -->
+    <main id="mainView"></main>
+  </div>
+
+  <!-- Modal PIN Game Master -->
+  <div id="gmPinModal" class="modal-backdrop hidden">
+    <div class="modal-box">
+      <h3 style="font-size:1.2rem;margin-bottom:8px;">🔐 Akses Game Master</h3>
+      <p style="color:var(--text-muted);font-size:0.88rem;margin-bottom:16px;">
+        Masukkan PIN Game Master untuk membuka kontrol penuh permainan. (PIN Default: <code>1234</code>)
+      </p>
+      <form id="gmPinForm">
+        <input
+          id="gmPinInput"
+          type="password"
+          class="input-field"
+          placeholder="Masukkan PIN (1234)"
+          autocomplete="off"
+          style="margin-bottom:14px;text-align:center;font-size:1.25rem;letter-spacing:0.25em;"
+        />
+        <div style="display:flex;gap:10px;justify-content:flex-end;">
+          <button type="button" id="cancelGmModalBtn" class="btn btn-outline">Batal</button>
+          <button type="submit" class="btn btn-amber">Masuk GM</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal Custom Word Bank (Game Master) -->
+  <div id="wordBankModal" class="modal-backdrop hidden">
+    <div class="modal-box" style="max-width:600px;">
+      <h3 style="font-size:1.2rem;margin-bottom:6px;">📝 Custom Word Bank Editor</h3>
+      <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:12px;">
+        Pisahkan setiap kata objek dengan baris baru (Enter) atau koma. Minimal 6 kata.
+      </p>
+      <textarea
+        id="wordBankTextarea"
+        class="textarea-field"
+        rows="10"
+        style="margin-bottom:14px;font-family:monospace;font-size:0.88rem;"
+      ></textarea>
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+        <span id="wordBankCountInfo" style="font-size:0.82rem;color:var(--text-muted);"></span>
+        <div style="display:flex;gap:10px;">
+          <button type="button" id="closeWordBankBtn" class="btn btn-outline">Tutup</button>
+          <button type="button" id="saveWordBankBtn" class="btn btn-emerald">Simpan Kata</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal Konfirmasi Kembalikan Semua ke Lobby (Game Master) -->
+  <div id="returnLobbyModal" class="modal-backdrop hidden">
+    <div class="modal-box">
+      <h3 style="font-size:1.2rem;margin-bottom:8px;">⚠️ Kembalikan Semua ke Lobby?</h3>
+      <p style="color:var(--text-muted);font-size:0.88rem;margin-bottom:18px;">
+        Permainan yang sedang berjalan di ronde ini akan dihentikan, dan seluruh peserta akan dikembalikan ke halaman Lobby bersama grupnya masing-masing. Apakah kamu yakin?
+      </p>
+      <div style="display:flex;gap:10px;justify-content:flex-end;">
+        <button type="button" id="cancelReturnLobbyBtn" class="btn btn-outline">Batal</button>
+        <button type="button" id="confirmReturnLobbyBtn" class="btn btn-rose">Ya, Kembalikan ke Lobby</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Container -->
+  <div id="toastContainer" class="toast-container"></div>
+
+  <script src="/qrcode.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
