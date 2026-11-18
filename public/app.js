@@ -1497,6 +1497,56 @@
     `;
   }
 
+  function renderGMClueControlsHTML(st, targetGroup) {
+    const revealed =
+      (targetGroup && targetGroup.clueRevealedCount) || st.clueRevealedCount || 1;
+    const maxLetters = (targetGroup && targetGroup.clueMaxLetters) || 1;
+    const isMaxed = revealed >= maxLetters;
+
+    return `
+      <button id="toggleClueBtn" class="btn btn-outline" style="width:100%;">
+        ${
+          st.clueActive
+            ? "🙈 Sembunyikan Clue dari Semua Orang"
+            : "💡 Tampilkan Clue (1 Huruf Awal + _ _ _)"
+        }
+      </button>
+      ${
+        st.clueActive
+          ? `<button
+              id="addClueLetterBtn"
+              class="btn btn-outline"
+              style="width:100%;border-color:rgba(245,158,11,0.55);color:#fde68a;"
+              ${isMaxed ? "disabled" : ""}
+            >
+              ${
+                isMaxed
+                  ? `✅ Maksimal Clue Tercapai (${revealed}/${maxLetters} Huruf)`
+                  : `➕ Tambah +1 Huruf Clue (${revealed}/${maxLetters} Huruf)`
+              }
+            </button>`
+          : ""
+      }
+    `;
+  }
+
+  function bindGMClueEvents() {
+    const toggleClueBtn = document.getElementById("toggleClueBtn");
+    if (toggleClueBtn) {
+      toggleClueBtn.addEventListener("click", () => {
+        playTone(620, 0.14);
+        sendAction("TOGGLE_CLUE");
+      });
+    }
+    const addClueLetterBtn = document.getElementById("addClueLetterBtn");
+    if (addClueLetterBtn) {
+      addClueLetterBtn.addEventListener("click", () => {
+        playTone(680, 0.14);
+        sendAction("ADD_CLUE_LETTER");
+      });
+    }
+  }
+
   function renderGuessingView(container, st) {
     const isGM = client.role === "game_master";
     const targetGroup = st.groups[st.activeGuessGroupIndex] || st.groups[0];
@@ -1533,16 +1583,12 @@
               ? `<div class="card">
                   <h3 style="font-size:1rem;margin-bottom:8px;">👑 Kontrol Game Master</h3>
                   <p style="font-size:0.82rem;color:var(--text-muted);margin-bottom:14px;">
-                    Berikan waktu bagi anggota grup lain untuk mengetik tebakan mereka. Kamu juga bisa menampilkan/menyembunyikan Clue 1 huruf awal.
+                    Berikan waktu bagi anggota grup lain untuk mengetik tebakan mereka. Kamu juga bisa menampilkan, menambah huruf, atau menyembunyikan Clue.
                   </p>
                   <div style="display:flex;flex-direction:column;gap:10px;">
-                    <button id="toggleClueBtn" class="btn btn-outline" style="width:100%;">
-                      ${
-                        st.clueActive
-                          ? "🙈 Sembunyikan Clue dari Semua Orang"
-                          : "💡 Tampilkan Clue (1 Huruf Awal + _ _ _)"
-                      }
-                    </button>
+                    <div id="gmClueControlsArea" style="display:flex;flex-direction:column;gap:10px;">
+                      ${renderGMClueControlsHTML(st, targetGroup)}
+                    </div>
                     <button id="revealAnswerBtn" class="btn btn-amber btn-lg">
                       🔓 Tampilkan Jawaban Asli (Reveal)
                     </button>
@@ -1597,13 +1643,7 @@
     bindGuessFormEvents();
 
     if (isGM) {
-      const toggleClueBtn = document.getElementById("toggleClueBtn");
-      if (toggleClueBtn) {
-        toggleClueBtn.addEventListener("click", () => {
-          playTone(620, 0.14);
-          sendAction("TOGGLE_CLUE");
-        });
-      }
+      bindGMClueEvents();
       document.getElementById("revealAnswerBtn").addEventListener("click", () => {
         playTone(780, 0.22);
         sendAction("REVEAL_CURRENT_GROUP");
@@ -1718,11 +1758,10 @@
       clueBannerArea.innerHTML = renderClueBannerHTML(targetGroup);
     }
 
-    const toggleClueBtn = document.getElementById("toggleClueBtn");
-    if (toggleClueBtn) {
-      toggleClueBtn.textContent = st.clueActive
-        ? "🙈 Sembunyikan Clue dari Semua Orang"
-        : "💡 Tampilkan Clue (1 Huruf Awal + _ _ _)";
+    const gmClueControlsArea = document.getElementById("gmClueControlsArea");
+    if (gmClueControlsArea) {
+      gmClueControlsArea.innerHTML = renderGMClueControlsHTML(st, targetGroup);
+      bindGMClueEvents();
     }
 
     const nextPtsBadge = document.getElementById("nextPointsBadge");

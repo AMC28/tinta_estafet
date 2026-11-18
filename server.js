@@ -7,7 +7,7 @@ const { DEFAULT_WORDS, BOT_NAMES, generateBotStrokesForTurn } = require("./words
 
 const PORT = process.env.PORT || 3000;
 const MAX_PLAYERS = 40;
-const GM_DEFAULT_PIN = process.env.GM_PIN || "12345678";
+const GM_DEFAULT_PIN = process.env.GM_PIN || "3015";
 
 // Konfigurasi Porsi Tinta Per Orang
 const INK_CAPACITY_MODES = {
@@ -70,6 +70,7 @@ const gameState = {
   groups: [], // Array of group objects
   activeGuessGroupIndex: 0, // Indeks grup (0 .. groupCount-1) yang sedang ditebak pada fase GUESSING / REVEAL
   clueActive: false, // Status apakah Clue huruf pertama + "_ _ _" sedang ditampilkan oleh GM
+  clueRevealedCount: 1, // Jumlah huruf awalan yang ditampilkan pada Clue
   guessFeed: [], // [{ id, playerName, groupId, text, isCorrect, isClose, timestamp }]
   accumulatedScores: {} // { [groupId]: number } untuk multi-ronde
 };
@@ -468,6 +469,7 @@ function startDrawingPhase() {
   gameState.phase = "DRAWING";
   gameState.activeGuessGroupIndex = 0;
   gameState.clueActive = false;
+  gameState.clueRevealedCount = 1;
   gameState.guessFeed = [];
 
   gameState.groups.forEach((group, idx) => {
@@ -507,6 +509,7 @@ function startGuessingForGroup(groupIndex) {
   gameState.phase = "GUESSING";
   gameState.activeGuessGroupIndex = groupIndex;
   gameState.clueActive = false;
+  gameState.clueRevealedCount = 1;
   gameState.guessFeed = [];
   broadcastState();
 
@@ -847,9 +850,14 @@ function buildClientState(role, playerId, deviceId = null, options = {}) {
       (Math.max(0, g.remainingInk) / Math.max(1, g.initialInk)) * 100
     );
 
-    // Clue 1 huruf pertama + "_ _ _" sesuai jumlah huruf kata rahasia jika diaktifkan oleh GM saat GUESSING
+    // Clue huruf awalan + "_ _ _" sesuai jumlah huruf kata rahasia jika diaktifkan oleh GM saat GUESSING
     const rawSecret = String(g.secretWord || "").trim();
     const secretChars = Array.from(rawSecret);
+    const maxClueLetters = Math.max(1, secretChars.length - 1);
+    const revealedCount = Math.max(
+      1,
+      Math.min(maxClueLetters, Number(gameState.clueRevealedCount) || 1)
+    );
     const showClueNow =
       gameState.phase === "GUESSING" &&
       idx === gameState.activeGuessGroupIndex &&
@@ -857,7 +865,7 @@ function buildClientState(role, playerId, deviceId = null, options = {}) {
       secretChars.length > 0;
     const clueText = showClueNow
       ? secretChars
-          .map((ch, cIdx) => (cIdx === 0 ? ch.toUpperCase() : /\s/.test(ch) ? "  " : "_"))
+          .map((ch, cIdx) => (cIdx < revealedCount ? ch.toUpperCase() : /\s/.test(ch) ? "  " : "_"))
           .join(" ")
       : null;
 
@@ -870,6 +878,8 @@ function buildClientState(role, playerId, deviceId = null, options = {}) {
       secretWord: canSeeSecretWord ? g.secretWord : "???",
       clueText,
       clueLength: showClueNow ? secretChars.length : null,
+      clueRevealedCount: showClueNow ? revealedCount : 0,
+      clueMaxLetters: secretChars.length > 0 ? maxClueLetters : 1,
       inkPerPlayer:
         g.inkPerPlayer ||
         INK_CAPACITY_MODES[gameState.settings.inkCapacityMode].ink_per_player,
@@ -907,6 +917,16 @@ function buildClientState(role, playerId, deviceId = null, options = {}) {
     return true;
   });
 
+  const activeGroupObj = gameState.groups[gameState.activeGuessGroupIndex];
+  const activeSecretChars = Array.from(
+    String(activeGroupObj ? activeGroupObj.secretWord : "").trim()
+  );
+  const activeMaxClueLetters = Math.max(1, activeSecretChars.length - 1);
+  const activeClueRevealedCount = Math.max(
+    1,
+    Math.min(activeMaxClueLetters, Number(gameState.clueRevealedCount) || 1)
+  );
+
   return {
     phase: gameState.phase,
     roundNumber: gameState.roundNumber,
@@ -921,6 +941,7 @@ function buildClientState(role, playerId, deviceId = null, options = {}) {
     boundPlayer: viewer && !viewer.isBot ? viewer : null,
     activeGuessGroupIndex: gameState.activeGuessGroupIndex,
     clueActive: Boolean(gameState.clueActive),
+    clueRevealedCount: activeClueRevealedCount,
     guessFeed: visibleGuessFeed,
     customWordsCount: gameState.customWords.length,
     customWords: role === "game_master" ? gameState.customWords : undefined,
@@ -1374,15 +1395,46 @@ function handleAction(action, payload, clientMeta) {
       if (gameState.phase !== "GUESSING") {
         return { ok: false, error: "Clue hanya dapat ditampilkan saat fase menebak." };
       }
-      gameState.clueActive =
+      const nextActive =
         typeof payload.active === "boolean" ? payload.active : !gameState.clueActive;
+      gameState.clueActive = nextActive;
+      gameState.clueRevealedCount = 1;
       broadcastState({ omitStrokes: true });
-      return { ok: true, clueActive: gameState.clueActive };
+      return {
+        ok: true,
+        clueActive: gameState.clueActive,
+        clueRevealedCount: gameState.clueRevealedCount
+      };
+    }
+
+    case "ADD_CLUE_LETTER": {
+      if (gameState.phase !== "GUESSING") {
+        return { ok: false, error: "Clue hanya dapat ditambah saat fase menebak." };
+      }
+      const targetGroup = gameState.groups[gameState.activeGuessGroupIndex];
+      const secretChars = Array.from(
+        String(targetGroup ? targetGroup.secretWord : "").trim()
+      );
+      const maxClueLetters = Math.max(1, secretChars.length - 1);
+
+      if (!gameState.clueActive) {
+        gameState.clueActive = true;
+        gameState.clueRevealedCount = 1;
+      } else if (gameState.clueRevealedCount < maxClueLetters) {
+        gameState.clueRevealedCount += 1;
+      }
+      broadcastState({ omitStrokes: true });
+      return {
+        ok: true,
+        clueActive: gameState.clueActive,
+        clueRevealedCount: gameState.clueRevealedCount
+      };
     }
 
     case "REVEAL_CURRENT_GROUP": {
       if (gameState.phase !== "GUESSING") return { ok: false };
       gameState.clueActive = false;
+      gameState.clueRevealedCount = 1;
       recalculateAllScores();
       gameState.phase = "REVEAL";
       broadcastState();
@@ -1429,6 +1481,7 @@ function handleAction(action, payload, clientMeta) {
       gameState.guessFeed = [];
       gameState.activeGuessGroupIndex = 0;
       gameState.clueActive = false;
+      gameState.clueRevealedCount = 1;
       if (gameState.roundNumber <= 1) {
         gameState.teamsLocked = false;
       }
@@ -1448,6 +1501,7 @@ function handleAction(action, payload, clientMeta) {
       gameState.phase = "LOBBY";
       gameState.guessFeed = [];
       gameState.clueActive = false;
+      gameState.clueRevealedCount = 1;
       gameState.groups = [];
       syncGroupsStructure();
       rebalanceGroups(true);
@@ -1521,7 +1575,9 @@ const server = http.createServer((req, res) => {
         const finalPlayerId =
           (result.player && result.player.id) || data.playerId || null;
         const omitStrokes =
-          data.action === "SUBMIT_GUESS" || data.action === "TOGGLE_CLUE";
+          data.action === "SUBMIT_GUESS" ||
+          data.action === "TOGGLE_CLUE" ||
+          data.action === "ADD_CLUE_LETTER";
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(
           JSON.stringify({
