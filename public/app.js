@@ -260,6 +260,12 @@
   function computeViewKey(st) {
     if (!client.role) return "ENTRY";
     if (!st) return "LOADING";
+    if (client.role === "game_master" && st.phase === "DRAWING") {
+      const gmGroupsKey = st.groups
+        .map((g) => `${g.id}:${g.status}:${g.currentTurnIndex}`)
+        .join(",");
+      return `${client.role}:${st.phase}:R${st.roundNumber}:${gmGroupsKey}`;
+    }
     const me = st.players.find((p) => p.id === client.playerId);
     const myGroupId = me ? me.groupId : 0;
     const myGroup = st.groups.find((g) => g.id === myGroupId);
@@ -1253,6 +1259,22 @@
             <div class="canvas-wrapper" style="margin-bottom:8px;">
               <canvas id="groupCanvas-${g.id}" class="drawing-canvas readonly" width="800" height="500"></canvas>
             </div>
+
+            ${
+              g.status !== "FINISHED"
+                ? `<div style="display:flex;justify-content:flex-end;">
+                    <button
+                      type="button"
+                      class="btn btn-amber btn-sm gm-skip-turn-btn"
+                      data-group-id="${g.id}"
+                      data-player-name="${escapeHtml(g.activePlayerName || "Pemain")}"
+                      title="Lewati giliran pemain yang sedang aktif di grup ini"
+                    >
+                      ⏭️ Skip Giliran ${escapeHtml(g.activePlayerName || "Pemain")}
+                    </button>
+                  </div>`
+                : ""
+            }
           </div>
         `;
       })
@@ -1293,6 +1315,22 @@
 
     document.getElementById("forceFinishDrawingBtn").addEventListener("click", () => {
       sendAction("FORCE_FINISH_DRAWING");
+    });
+
+    document.querySelectorAll(".gm-skip-turn-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const groupId = Number(btn.getAttribute("data-group-id"));
+        const res = await sendAction("GM_SKIP_MEMBER_TURN", { groupId });
+        if (res.ok) {
+          playTone(480, 0.14);
+          showToast(
+            `⏭️ Giliran ${res.skippedName} di ${res.groupName} dilewati oleh Admin`,
+            "#f59e0b"
+          );
+        } else {
+          showToast(res.error || "Gagal melewati giliran", "#f43f5e");
+        }
+      });
     });
   }
 
@@ -1445,6 +1483,20 @@
   // ============================================================================
   // 4. FASE MENEBAK GAMBAR (STEP 4: GUESSING)
   // ============================================================================
+  function renderClueBannerHTML(targetGroup) {
+    if (!targetGroup || !targetGroup.clueText) return "";
+    return `
+      <div class="card" style="background:rgba(245,158,11,0.16);border:1px solid rgba(245,158,11,0.5);text-align:center;padding:12px 16px;">
+        <div style="font-size:0.78rem;color:#fde68a;text-transform:uppercase;font-weight:700;letter-spacing:0.06em;">
+          💡 Clue dari Game Master (${targetGroup.clueLength || ""} Huruf)
+        </div>
+        <div style="font-size:1.75rem;font-weight:900;letter-spacing:0.18em;color:#ffffff;font-family:monospace;margin-top:4px;">
+          ${escapeHtml(targetGroup.clueText)}
+        </div>
+      </div>
+    `;
+  }
+
   function renderGuessingView(container, st) {
     const isGM = client.role === "game_master";
     const targetGroup = st.groups[st.activeGuessGroupIndex] || st.groups[0];
@@ -1472,16 +1524,29 @@
             </p>
           </div>
 
+          <div id="clueBannerArea">
+            ${renderClueBannerHTML(targetGroup)}
+          </div>
+
           ${
             isGM
               ? `<div class="card">
                   <h3 style="font-size:1rem;margin-bottom:8px;">👑 Kontrol Game Master</h3>
                   <p style="font-size:0.82rem;color:var(--text-muted);margin-bottom:14px;">
-                    Berikan waktu bagi anggota grup lain untuk mengetik tebakan mereka, lalu klik tombol di bawah untuk membuka jawaban asli.
+                    Berikan waktu bagi anggota grup lain untuk mengetik tebakan mereka. Kamu juga bisa menampilkan/menyembunyikan Clue 1 huruf awal.
                   </p>
-                  <button id="revealAnswerBtn" class="btn btn-amber btn-lg">
-                    🔓 Tampilkan Jawaban Asli (Reveal)
-                  </button>
+                  <div style="display:flex;flex-direction:column;gap:10px;">
+                    <button id="toggleClueBtn" class="btn btn-outline" style="width:100%;">
+                      ${
+                        st.clueActive
+                          ? "🙈 Sembunyikan Clue dari Semua Orang"
+                          : "💡 Tampilkan Clue (1 Huruf Awal + _ _ _)"
+                      }
+                    </button>
+                    <button id="revealAnswerBtn" class="btn btn-amber btn-lg">
+                      🔓 Tampilkan Jawaban Asli (Reveal)
+                    </button>
+                  </div>
                 </div>`
               : isDrawerGroupMember
               ? `<div class="card" style="background:rgba(99,102,241,0.14);border-color:rgba(99,102,241,0.4);">
@@ -1532,6 +1597,13 @@
     bindGuessFormEvents();
 
     if (isGM) {
+      const toggleClueBtn = document.getElementById("toggleClueBtn");
+      if (toggleClueBtn) {
+        toggleClueBtn.addEventListener("click", () => {
+          playTone(620, 0.14);
+          sendAction("TOGGLE_CLUE");
+        });
+      }
       document.getElementById("revealAnswerBtn").addEventListener("click", () => {
         playTone(780, 0.22);
         sendAction("REVEAL_CURRENT_GROUP");
@@ -1639,6 +1711,18 @@
     const badge = document.getElementById("correctCountBadge");
     if (badge) {
       badge.textContent = `${targetGroup.correctGuessers.length} orang`;
+    }
+
+    const clueBannerArea = document.getElementById("clueBannerArea");
+    if (clueBannerArea) {
+      clueBannerArea.innerHTML = renderClueBannerHTML(targetGroup);
+    }
+
+    const toggleClueBtn = document.getElementById("toggleClueBtn");
+    if (toggleClueBtn) {
+      toggleClueBtn.textContent = st.clueActive
+        ? "🙈 Sembunyikan Clue dari Semua Orang"
+        : "💡 Tampilkan Clue (1 Huruf Awal + _ _ _)";
     }
 
     const nextPtsBadge = document.getElementById("nextPointsBadge");
