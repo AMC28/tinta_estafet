@@ -208,6 +208,26 @@
 
   function handleStateUpdate(newState) {
     const prevState = client.state;
+
+    // Jika server mengirim state ringan (strokesOmitted) saat menebak gambar,
+    // pertahankan data strokes kanvas yang sudah ada di memori browser agar hemat bandwidth
+    if (
+      newState &&
+      newState.strokesOmitted &&
+      prevState &&
+      Array.isArray(prevState.groups) &&
+      Array.isArray(newState.groups)
+    ) {
+      newState.groups.forEach((g) => {
+        const prevG = prevState.groups.find((pg) => pg.id === g.id);
+        if (prevG && Array.isArray(prevG.strokes)) {
+          g.strokes = prevG.strokes;
+        } else if (!Array.isArray(g.strokes)) {
+          g.strokes = [];
+        }
+      });
+    }
+
     client.state = newState;
     syncSessionWithState(newState);
     updateTopbar();
@@ -638,10 +658,24 @@
 
               <div style="margin-bottom:12px;">
                 <label style="display:block;font-size:0.8rem;color:var(--text-muted);margin-bottom:4px;">
+                  Kapasitas Maksimal Pemain
+                </label>
+                <select id="settingMaxPlayers" class="select-field">
+                  ${[20, 30, 40, 50, 60]
+                    .map(
+                      (cap) =>
+                        `<option value="${cap}" ${(st.settings.maxPlayers || st.maxPlayers) === cap ? "selected" : ""}>Maksimal ${cap} Pemain</option>`
+                    )
+                    .join("")}
+                </select>
+              </div>
+
+              <div style="margin-bottom:12px;">
+                <label style="display:block;font-size:0.8rem;color:var(--text-muted);margin-bottom:4px;">
                   Jumlah Grup ${st.teamsLocked ? "(Terkunci di Ronde " + st.roundNumber + ")" : ""}
                 </label>
                 <select id="settingGroupCount" class="select-field" ${st.teamsLocked ? "disabled" : ""}>
-                  ${[2, 3, 4, 5, 6]
+                  ${[2, 3, 4, 5, 6, 7, 8]
                     .map(
                       (n) =>
                         `<option value="${n}" ${st.settings.groupCount === n ? "selected" : ""}>${n} Grup</option>`
@@ -651,12 +685,12 @@
               </div>
 
               <div style="margin-bottom:12px;">
-                <label style="display:block;font-size:0.8rem;color:var(--text-muted);margin-bottom:4px;">Mode Kapasitas Tinta Grup</label>
+                <label style="display:block;font-size:0.8rem;color:var(--text-muted);margin-bottom:4px;">Porsi Tinta Per Orang</label>
                 <select id="settingInkMode" class="select-field">
                   ${Object.entries(st.inkCapacityModes)
                     .map(
                       ([key, info]) =>
-                        `<option value="${key}" ${st.settings.inkCapacityMode === key ? "selected" : ""}>${key} (${info.total_group_ink} Tinta) — ${info.description}</option>`
+                        `<option value="${key}" ${st.settings.inkCapacityMode === key ? "selected" : ""}>${key} (${info.ink_per_player || info.total_group_ink} Tinta / Orang) — ${info.description}</option>`
                     )
                     .join("")}
                 </select>
@@ -680,8 +714,11 @@
               <div style="margin-bottom:12px;">
                 <label style="display:block;font-size:0.8rem;color:var(--text-muted);margin-bottom:4px;">Aturan Sisa Tinta Saat Klik Pass</label>
                 <select id="settingPassBehavior" class="select-field">
+                  <option value="PORSI_TETAP" ${st.settings.passInkBehavior === "PORSI_TETAP" ? "selected" : ""}>
+                    PORSI TETAP (Jatah tiap orang tetap, sisa tinta ditabung untuk Bonus Grup)
+                  </option>
                   <option value="INHERITED" ${st.settings.passInkBehavior === "INHERITED" ? "selected" : ""}>
-                    INHERITED (Diwariskan ke teman grup berikutnya)
+                    INHERITED (Sisa tinta diwariskan ke teman grup berikutnya)
                   </option>
                   <option value="WASTED" ${st.settings.passInkBehavior === "WASTED" ? "selected" : ""}>
                     WASTED (Sisa jatah tinta pemain tersebut hangus)
@@ -691,7 +728,7 @@
 
               <div style="margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;">
                 <label for="settingFuzzy" style="font-size:0.82rem;color:#cbd5e1;cursor:pointer;">
-                  Toleransi Typo 1 Huruf (Fuzzy Matching)
+                  Notifikasi "Hampir Benar" Saat Tebakan Mendekati (Fuzzy)
                 </label>
                 <input id="settingFuzzy" type="checkbox" ${st.settings.fuzzyMatching ? "checked" : ""} style="width:18px;height:18px;cursor:pointer;" />
               </div>
@@ -770,6 +807,7 @@
 
       const triggerSettingsUpdate = async () => {
         const res = await sendAction("UPDATE_SETTINGS", {
+          maxPlayers: Number(document.getElementById("settingMaxPlayers").value),
           groupCount: Number(document.getElementById("settingGroupCount").value),
           inkCapacityMode: document.getElementById("settingInkMode").value,
           turnDurationSeconds: Number(document.getElementById("settingTurnDuration").value),
@@ -781,6 +819,7 @@
         }
       };
 
+      document.getElementById("settingMaxPlayers").addEventListener("change", triggerSettingsUpdate);
       document.getElementById("settingGroupCount").addEventListener("change", triggerSettingsUpdate);
       document.getElementById("settingInkMode").addEventListener("change", triggerSettingsUpdate);
       document.getElementById("settingTurnDuration").addEventListener("change", triggerSettingsUpdate);
@@ -896,9 +935,15 @@
               }
             </div>
             <div style="text-align:right;font-size:0.82rem;color:var(--text-muted);">
-              <div>Mode Tinta: <strong>${st.settings.inkCapacityMode} (${modeInfo ? modeInfo.total_group_ink : 3200})</strong></div>
+              <div>Porsi Tinta: <strong>${st.settings.inkCapacityMode} (${modeInfo ? modeInfo.ink_per_player || modeInfo.total_group_ink : 2000} Tinta / Orang)</strong></div>
               <div>Waktu Giliran: <strong>${st.settings.turnDurationSeconds === 0 ? "♾️ Tanpa Batas Waktu" : `${st.settings.turnDurationSeconds} detik`}</strong></div>
-              <div>Sisa Tinta Pass: <strong>${st.settings.passInkBehavior === "INHERITED" ? "Diwariskan" : "Hangus"}</strong></div>
+              <div>Sisa Tinta Pass: <strong>${
+                st.settings.passInkBehavior === "INHERITED"
+                  ? "Diwariskan"
+                  : st.settings.passInkBehavior === "WASTED"
+                  ? "Hangus"
+                  : "Ditabung ke Bonus Grup (Porsi Tetap)"
+              }</strong></div>
             </div>
           </div>
         </div>
@@ -985,7 +1030,13 @@
 
               <div>
                 <div style="display:flex;justify-content:space-between;font-size:0.78rem;margin-bottom:4px;">
-                  <span>🖌️ Jatah Tinta Giliran Ini (${st.settings.passInkBehavior === "INHERITED" ? "Warisan Aktif" : "Hangus Jika Pass"})</span>
+                  <span>🖌️ Porsi Tinta Giliran Ini (${
+                    st.settings.passInkBehavior === "INHERITED"
+                      ? "Warisan Aktif"
+                      : st.settings.passInkBehavior === "WASTED"
+                      ? "Hangus Jika Pass"
+                      : "Porsi Tetap • Sisa Ditabung"
+                  })</span>
                   <strong id="turnInkText-${myGroup.id}">${myGroup.turnInkRemaining} / ${myGroup.turnInkLimit} (${turnPct}%)</strong>
                 </div>
                 <div class="ink-bar-track">
@@ -1504,13 +1555,13 @@
           id="guessTextInput"
           type="text"
           class="input-field"
-          placeholder="Tebak nama objek gambar ini..."
+          placeholder="Tebak 1 kata objek gambar ini..."
           autocomplete="off"
           required
         />
         <button type="submit" class="btn btn-emerald">Kirim</button>
       </form>
-      <div id="guessHintMsg" style="font-size:0.8rem;margin-top:6px;min-height:18px;"></div>
+      <div id="guessHintMsg" style="font-size:0.84rem;margin-top:8px;min-height:20px;font-weight:700;"></div>
     `;
   }
 
@@ -1524,7 +1575,11 @@
           <div class="guess-item ${item.isCorrect ? "correct" : item.isClose ? "close" : ""}">
             <span style="font-weight:700;">${escapeHtml(item.playerName)} (Grup ${item.groupId}):</span>
             <span>${escapeHtml(item.text)}</span>
-            ${item.isClose ? `<span style="font-size:0.74rem;color:#fde68a;margin-left:6px;">(Hampir benar!)</span>` : ""}
+            ${
+              item.isClose
+                ? `<span style="font-size:0.74rem;color:#fde68a;font-weight:700;margin-left:6px;">🔥 Mendekati! (Hanya terlihat olehmu)</span>`
+                : ""
+            }
           </div>
         `;
       })
@@ -1555,10 +1610,14 @@
           "#10b981"
         );
       } else if (res.isClose) {
-        playTone(580, 0.15);
+        playTone(580, 0.18);
+        showToast(
+          `🔥 Hampir benar! Jawabanmu "${text}" sudah sangat mendekati! (Cukup 1 kata)`,
+          "#f59e0b"
+        );
         if (hintEl) {
           hintEl.style.color = "#fde68a";
-          hintEl.textContent = "🔥 Hampir benar! Cek kembali ejaanmu!";
+          hintEl.textContent = `🔥 Hampir benar! Jawabanmu ("${text}") sudah mendekati — cukup ketik 1 kata utamanya & cek ejaanmu! (Hanya terlihat olehmu)`;
         }
       } else if (hintEl) {
         hintEl.style.color = "#f87171";

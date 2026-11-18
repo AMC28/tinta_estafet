@@ -6,21 +6,24 @@ const os = require("os");
 const { DEFAULT_WORDS, BOT_NAMES, generateBotStrokesForTurn } = require("./words");
 
 const PORT = process.env.PORT || 3000;
-const MAX_PLAYERS = 30;
+const MAX_PLAYERS = 40;
 const GM_DEFAULT_PIN = process.env.GM_PIN || "1234";
 
-// Konfigurasi sesuai Blueprint
+// Konfigurasi Porsi Tinta Per Orang
 const INK_CAPACITY_MODES = {
   HEMAT: {
-    total_group_ink: 2200,
-    description: "Menantang, membutuhkan efisiensi goresan tinggi"
+    ink_per_player: 1000,
+    total_group_ink: 1000,
+    description: "Menantang, butuh efisiensi goresan tinggi"
   },
   STANDAR: {
-    total_group_ink: 3200,
-    description: "Seimbang untuk 5-6 anggota per grup"
+    ink_per_player: 2000,
+    total_group_ink: 2000,
+    description: "Porsi seimbang untuk setiap pemain"
   },
   BANYAK: {
-    total_group_ink: 4500,
+    ink_per_player: 4000,
+    total_group_ink: 4000,
     description: "Leluasa untuk detail gambar dan warna"
   }
 };
@@ -31,7 +34,9 @@ const GROUP_COLORS = [
   { id: 3, name: "Grup 3 (Hijau)", badge: "#10B981", light: "#D1FAE5" },
   { id: 4, name: "Grup 4 (Kuning)", badge: "#F59E0B", light: "#FEF3C7" },
   { id: 5, name: "Grup 5 (Ungu)", badge: "#8B5CF6", light: "#EDE9FE" },
-  { id: 6, name: "Grup 6 (Pink)", badge: "#EC4899", light: "#FCE7F3" }
+  { id: 6, name: "Grup 6 (Pink)", badge: "#EC4899", light: "#FCE7F3" },
+  { id: 7, name: "Grup 7 (Cyan)", badge: "#06B6D4", light: "#CFFAFE" },
+  { id: 8, name: "Grup 8 (Oranye)", badge: "#F97316", light: "#FFEDD5" }
 ];
 
 const DRAWING_TOOLS = {
@@ -52,11 +57,12 @@ const gameState = {
   roundNumber: 1,
   teamsLocked: false, // Dikunci setelah ronde pertama dimulai agar tim tidak teracak lagi di ronde berikutnya
   settings: {
-    groupCount: 4, // [2, 3, 4, 5, 6]
-    inkCapacityMode: "STANDAR", // HEMAT | STANDAR | BANYAK
-    turnDurationSeconds: 20, // [15, 20, 30]
-    passInkBehavior: "INHERITED", // INHERITED | WASTED
-    fuzzyMatching: true // Toleransi typo 1 huruf pada kata >= 5 karakter
+    maxPlayers: 40, // [20, 30, 40, 50, 60]
+    groupCount: 4, // [2, 3, 4, 5, 6, 7, 8]
+    inkCapacityMode: "STANDAR", // HEMAT | STANDAR | BANYAK (Porsi Per Orang)
+    turnDurationSeconds: 20, // [0, 15, 20, 30]
+    passInkBehavior: "PORSI_TETAP", // PORSI_TETAP | INHERITED | WASTED
+    fuzzyMatching: true // Deteksi tebakan mendekati untuk memunculkan tulisan "Hampir benar!"
   },
   customWords: [...DEFAULT_WORDS],
   usedWords: new Set(),
@@ -72,9 +78,16 @@ const wsClients = new Map();
 
 // Interval Timer Server (100ms tick untuk akurasi waktu & aksi Bot)
 let gameLoopTimer = null;
+let wsKeepAliveTimer = null;
 
-// Mendapatkan daftar alamat IP Lokal (LAN) agar mudah diakses jika lokal
+// Cache alamat IP Lokal (LAN) selama 30 detik agar tidak membebani CPU saat broadcast ke 40 pemain
+let cachedLocalIPs = null;
+let cachedLocalIPsAt = 0;
 function getLocalIPs() {
+  const now = Date.now();
+  if (cachedLocalIPs && now - cachedLocalIPsAt < 30000) {
+    return cachedLocalIPs;
+  }
   const interfaces = os.networkInterfaces();
   const ips = [];
   for (const name of Object.keys(interfaces)) {
@@ -84,6 +97,8 @@ function getLocalIPs() {
       }
     }
   }
+  cachedLocalIPs = ips;
+  cachedLocalIPsAt = now;
   return ips;
 }
 
@@ -119,15 +134,18 @@ function shuffleArray(arr) {
   return copy;
 }
 
-// Inisialisasi struktur grup berdasarkan settings.groupCount
+// Inisialisasi struktur grup berdasarkan settings.groupCount & porsi tinta per orang
 function syncGroupsStructure() {
   const count = gameState.settings.groupCount;
-  const totalInk = INK_CAPACITY_MODES[gameState.settings.inkCapacityMode].total_group_ink;
+  const inkPerPlayer = INK_CAPACITY_MODES[gameState.settings.inkCapacityMode].ink_per_player;
   const newGroups = [];
 
   for (let i = 1; i <= count; i++) {
     const existing = gameState.groups.find((g) => g.id === i);
-    const meta = GROUP_COLORS[i - 1];
+    const meta = GROUP_COLORS[i - 1] || GROUP_COLORS[0];
+    const memberCount = Math.max(1, gameState.players.filter((p) => p.groupId === i).length);
+    const calculatedGroupInk = memberCount * inkPerPlayer;
+
     newGroups.push({
       id: i,
       name: `Grup ${i}`,
@@ -135,11 +153,12 @@ function syncGroupsStructure() {
       color: meta.badge,
       lightColor: meta.light,
       secretWord: existing ? existing.secretWord : "",
-      initialInk: totalInk,
-      remainingInk: gameState.phase === "LOBBY" ? totalInk : (existing ? existing.remainingInk : totalInk),
+      inkPerPlayer,
+      initialInk: gameState.phase === "LOBBY" ? calculatedGroupInk : (existing ? existing.initialInk : calculatedGroupInk),
+      remainingInk: gameState.phase === "LOBBY" ? calculatedGroupInk : (existing ? existing.remainingInk : calculatedGroupInk),
       carriedOverInk: existing ? existing.carriedOverInk : 0,
-      turnInkLimit: existing ? existing.turnInkLimit : totalInk,
-      turnInkRemaining: existing ? existing.turnInkRemaining : totalInk,
+      turnInkLimit: existing ? existing.turnInkLimit : inkPerPlayer,
+      turnInkRemaining: existing ? existing.turnInkRemaining : inkPerPlayer,
       currentTurnIndex: existing ? existing.currentTurnIndex : 0,
       status: existing ? existing.status : "WAITING", // WAITING | COUNTDOWN | DRAWING | FINISHED
       countdownEndAt: existing ? existing.countdownEndAt : 0,
@@ -250,9 +269,12 @@ function startGroupMemberTurn(group, turnIndex, withCountdown = true) {
   }
 
   group.currentTurnIndex = turnIndex;
-  const baseShare = group.initialInk / Math.max(1, members.length);
+  const inkPerPlayer =
+    group.inkPerPlayer ||
+    INK_CAPACITY_MODES[gameState.settings.inkCapacityMode].ink_per_player;
+  const baseShare = inkPerPlayer;
 
-  // Hitung kuota tinta untuk giliran pemain ini
+  // Hitung kuota tinta untuk giliran pemain ini sesuai porsi per orang (+ warisan jika mode INHERITED)
   const desiredTurnInk = Math.min(
     group.remainingInk,
     baseShare + (group.carriedOverInk || 0)
@@ -406,10 +428,14 @@ function handlePassTurn(groupId, playerId, isManualPass = true) {
   if (gameState.settings.passInkBehavior === "INHERITED") {
     // Sisa tinta pemain diwariskan ke pemain berikutnya dalam grup
     group.carriedOverInk = isLastMember ? 0 : leftoverTurnInk;
-  } else {
+  } else if (gameState.settings.passInkBehavior === "WASTED") {
     // Mode WASTED: Sisa tinta jatah pemain tersebut hangus saat klik Pass / selesai giliran
     group.carriedOverInk = 0;
     group.remainingInk = Math.max(0, group.remainingInk - leftoverTurnInk);
+  } else {
+    // Mode PORSI_TETAP (Default): Porsi pemain berikutnya tetap sesuai porsi per orang,
+    // sedangkan sisa tinta pemain ini otomatis ditabung di remainingInk untuk Bonus Skor Grup
+    group.carriedOverInk = 0;
   }
 
   group.turnInkRemaining = 0;
@@ -434,7 +460,7 @@ function startDrawingPhase() {
   syncGroupsStructure();
   normalizeGroupTurnOrders();
   const secretWords = pickSecretWords(gameState.settings.groupCount);
-  const totalInk = INK_CAPACITY_MODES[gameState.settings.inkCapacityMode].total_group_ink;
+  const inkPerPlayer = INK_CAPACITY_MODES[gameState.settings.inkCapacityMode].ink_per_player;
 
   // Kunci pembagian tim sejak Ronde 1 dimulai agar di ronde berikutnya tim tidak diacak ulang
   gameState.teamsLocked = true;
@@ -444,9 +470,11 @@ function startDrawingPhase() {
 
   gameState.groups.forEach((group, idx) => {
     const members = getGroupMembers(group.id);
+    const totalGroupInk = Math.max(1, members.length) * inkPerPlayer;
     group.secretWord = secretWords[idx] || DEFAULT_WORDS[idx];
-    group.initialInk = totalInk;
-    group.remainingInk = totalInk;
+    group.inkPerPlayer = inkPerPlayer;
+    group.initialInk = totalGroupInk;
+    group.remainingInk = totalGroupInk;
     group.carriedOverInk = 0;
     group.strokes = [];
     group.correctGuessers = [];
@@ -554,16 +582,52 @@ function handlePlayerGuess(playerId, rawText) {
   if (!text) return { ok: false };
 
   const secret = targetGroup.secretWord.trim();
-  const dist = levenshteinDistance(text, secret);
+  const sLower = secret.toLowerCase();
+  const gLower = text.toLowerCase().replace(/\s+/g, " ");
+  const dist = levenshteinDistance(gLower, sLower);
 
-  const isExact = dist === 0;
-  const isFuzzyCorrect =
-    !isExact &&
-    gameState.settings.fuzzyMatching &&
-    secret.length >= 5 &&
-    dist === 1;
-  const isCorrect = isExact || isFuzzyCorrect;
-  const isClose = !isCorrect && ((secret.length >= 4 && dist === 1) || (secret.length >= 6 && dist === 2));
+  // Jawaban dianggap BENAR hanya jika sama persis (exact match, tidak peduli huruf besar/kecil)
+  const isCorrect = dist === 0;
+  const isFuzzyCorrect = false;
+
+  // Fuzzy Matching: jika aktif, deteksi apakah jawaban mendekati / hampir benar
+  // (typo 1-2 huruf, spasi terpisah seperti "kaca mata", atau peserta mengetik beberapa kata yang memuat kata rahasia)
+  const gJoined = gLower.replace(/[\s\-_]+/g, "");
+  const sJoined = sLower.replace(/[\s\-_]+/g, "");
+  const joinedDist = levenshteinDistance(gJoined, sJoined);
+
+  const guessTokens = gLower.split(/[\s\-_,./]+/).filter(Boolean);
+  const isTokenClose =
+    !isCorrect &&
+    guessTokens.some((token) => {
+      if (token === sLower) return true; // Kata rahasia ada di dalam rangkaian beberapa kata yang diketik peserta
+      const tDist = levenshteinDistance(token, sLower);
+      if (sLower.length >= 3 && tDist === 1) return true;
+      if (sLower.length >= 5 && tDist === 2) return true;
+      if (
+        token.length >= 3 &&
+        (sLower.includes(token) || token.includes(sLower)) &&
+        token.length >= Math.ceil(sLower.length * 0.6)
+      ) {
+        return true;
+      }
+      return false;
+    });
+
+  const isWholeClose =
+    !isCorrect &&
+    ((secret.length >= 3 && dist === 1) ||
+      (secret.length >= 5 && dist === 2) ||
+      joinedDist === 0 ||
+      (sJoined.length >= 3 && joinedDist === 1) ||
+      (gLower.length >= 3 &&
+        (sLower.includes(gLower) || gLower.includes(sLower)) &&
+        gLower.length >= Math.ceil(sLower.length * 0.6)));
+
+  const isClose =
+    !isCorrect &&
+    Boolean(gameState.settings.fuzzyMatching) &&
+    (isWholeClose || isTokenClose);
 
   if (isCorrect) {
     // Urutan penebak benar (0-indexed) -> Poin mulai dari 30, turun 3 poin tiap urutan berikutnya, minimal 5 poin
@@ -582,6 +646,7 @@ function handlePlayerGuess(playerId, rawText) {
 
     gameState.guessFeed.unshift({
       id: crypto.randomUUID(),
+      playerId: player.id,
       playerName: player.name,
       groupId: player.groupId,
       text: `🎉 Berhasil menebak benar! (Tercepat #${rank} • +${pointsEarned} Poin)`,
@@ -596,7 +661,8 @@ function handlePlayerGuess(playerId, rawText) {
       gameState.guessFeed.length = 60;
     }
 
-    broadcastState();
+    // Saat pemain menebak, gambar di kanvas tidak berubah -> broadcast state ringan tanpa strokes!
+    broadcastState({ omitStrokes: true });
     return {
       ok: true,
       isCorrect: true,
@@ -608,6 +674,7 @@ function handlePlayerGuess(playerId, rawText) {
   } else {
     gameState.guessFeed.unshift({
       id: crypto.randomUUID(),
+      playerId: player.id,
       playerName: player.name,
       groupId: player.groupId,
       text,
@@ -621,7 +688,8 @@ function handlePlayerGuess(playerId, rawText) {
     gameState.guessFeed.length = 60;
   }
 
-  broadcastState();
+  // Broadcast state ringan tanpa mengirim ulang ribuan titik gambar
+  broadcastState({ omitStrokes: true });
   return { ok: true, isCorrect: false, isFuzzyCorrect: false, isClose };
 }
 
@@ -714,16 +782,31 @@ function startServerGameLoop() {
       broadcastState();
     }
   }, 200);
+
+  // WebSocket Keep-Alive Ping tiap 25 detik agar koneksi di Railway / Cloud Proxy tidak putus saat idle
+  if (wsKeepAliveTimer) clearInterval(wsKeepAliveTimer);
+  wsKeepAliveTimer = setInterval(() => {
+    const pingFrame = Buffer.from([0x89, 0x00]);
+    for (const [ws] of wsClients.entries()) {
+      if (ws && !ws.destroyed && ws.writable) {
+        try {
+          ws.write(pingFrame);
+        } catch (e) {}
+      }
+    }
+  }, 25000);
 }
 
 // Membuat payload state yang aman sesuai Role & Grup penerima (agar kata rahasia grup lain tidak bocor)
-function buildClientState(role, playerId, deviceId = null) {
+function buildClientState(role, playerId, deviceId = null, options = {}) {
+  const omitStrokes = Boolean(options && options.omitStrokes);
   let viewer = gameState.players.find((p) => p.id === playerId) || null;
   if (!viewer && deviceId) {
     viewer = gameState.players.find((p) => !p.isBot && p.deviceId === deviceId) || null;
   }
   const viewerGroupId = viewer ? viewer.groupId : null;
   const now = Date.now();
+  const localIPs = getLocalIPs();
 
   const sanitizedGroups = gameState.groups.map((g, idx) => {
     const members = getGroupMembers(g.id);
@@ -745,14 +828,16 @@ function buildClientState(role, playerId, deviceId = null) {
       (gameState.phase === "DRAWING" && viewerGroupId === g.id);
 
     // Kapan kanvas (strokes) grup ini dikirim ke klien?
-    // 1. Anggota grup itu sendiri (Open Relay)
-    // 2. Saat grup tersebut sedang ditebak/di-reveal/leaderboard
-    // 3. Game Master
+    // - Saat DRAWING: hanya anggota grup itu sendiri (Open Relay) & Game Master
+    // - Saat GUESSING & REVEAL: HANYA 1 grup yang sedang ditebak saja (bergantian Kelompok 1, lalu Kelompok 2, dst.)
+    // - Saat LEADERBOARD: semua grup untuk galeri akhir
+    const isCurrentlyGuessedGroup =
+      (gameState.phase === "GUESSING" || gameState.phase === "REVEAL") &&
+      idx === gameState.activeGuessGroupIndex;
+
     const canSeeCanvas =
-      role === "game_master" ||
-      viewerGroupId === g.id ||
-      gameState.phase === "GUESSING" ||
-      gameState.phase === "REVEAL" ||
+      (gameState.phase === "DRAWING" && (role === "game_master" || viewerGroupId === g.id)) ||
+      isCurrentlyGuessedGroup ||
       gameState.phase === "LEADERBOARD";
 
     const remainingInkPct = Math.round(
@@ -766,6 +851,9 @@ function buildClientState(role, playerId, deviceId = null) {
       color: g.color,
       lightColor: g.lightColor,
       secretWord: canSeeSecretWord ? g.secretWord : "???",
+      inkPerPlayer:
+        g.inkPerPlayer ||
+        INK_CAPACITY_MODES[gameState.settings.inkCapacityMode].ink_per_player,
       initialInk: g.initialInk,
       remainingInk: Math.round(g.remainingInk),
       remainingInkPct,
@@ -786,17 +874,26 @@ function buildClientState(role, playerId, deviceId = null) {
             : Math.max(0, Math.ceil((g.turnEndAt - now) / 1000))
           : 0,
       members,
-      strokes: canSeeCanvas ? g.strokes : [],
+      strokes: omitStrokes ? undefined : canSeeCanvas ? g.strokes : [],
       correctGuessers: g.correctGuessers,
       scoreBreakdown: g.scoreBreakdown
     };
+  });
+
+  // Filter guessFeed: tebakan yang "hampir benar / mendekati" (isClose) HANYA boleh terlihat oleh peserta itu sendiri
+  const visibleGuessFeed = gameState.guessFeed.filter((item) => {
+    if (item.isClose) {
+      return Boolean(viewer && item.playerId && item.playerId === viewer.id);
+    }
+    return true;
   });
 
   return {
     phase: gameState.phase,
     roundNumber: gameState.roundNumber,
     teamsLocked: Boolean(gameState.teamsLocked),
-    maxPlayers: MAX_PLAYERS,
+    strokesOmitted: omitStrokes,
+    maxPlayers: gameState.settings.maxPlayers || MAX_PLAYERS,
     settings: gameState.settings,
     inkCapacityModes: INK_CAPACITY_MODES,
     drawingTools: DRAWING_TOOLS,
@@ -804,10 +901,10 @@ function buildClientState(role, playerId, deviceId = null) {
     groups: sanitizedGroups,
     boundPlayer: viewer && !viewer.isBot ? viewer : null,
     activeGuessGroupIndex: gameState.activeGuessGroupIndex,
-    guessFeed: gameState.guessFeed,
+    guessFeed: visibleGuessFeed,
     customWordsCount: gameState.customWords.length,
     customWords: role === "game_master" ? gameState.customWords : undefined,
-    localIPs: getLocalIPs(),
+    localIPs,
     port: PORT,
     serverTime: now
   };
@@ -847,11 +944,11 @@ function sendWsMessage(ws, obj) {
   }
 }
 
-function broadcastState() {
+function broadcastState(options = {}) {
   for (const [ws, meta] of wsClients.entries()) {
     sendWsMessage(ws, {
       type: "STATE_UPDATE",
-      state: buildClientState(meta.role, meta.playerId, meta.deviceId)
+      state: buildClientState(meta.role, meta.playerId, meta.deviceId, options)
     });
   }
 }
@@ -889,9 +986,10 @@ function handleAction(action, payload, clientMeta) {
       }
 
       if (!player) {
+        const currentMaxPlayers = gameState.settings.maxPlayers || MAX_PLAYERS;
         if (!name) return { ok: false, error: "Nama panggilan wajib diisi." };
-        if (gameState.players.length >= MAX_PLAYERS) {
-          return { ok: false, error: `Lobby penuh (Maksimal ${MAX_PLAYERS} pemain).` };
+        if (gameState.players.length >= currentMaxPlayers) {
+          return { ok: false, error: `Lobby penuh (Maksimal ${currentMaxPlayers} pemain).` };
         }
         player = {
           id: crypto.randomUUID(),
@@ -904,6 +1002,7 @@ function handleAction(action, payload, clientMeta) {
         };
         gameState.players.push(player);
         assignNewPlayerToBalancedGroup(player);
+        syncGroupsStructure();
       } else {
         // Perangkat sudah terdaftar sebagai pemain -> gunakan pemain yang sama (tidak boleh buat pemain ke-2)
         if (deviceId && !player.deviceId) {
@@ -953,8 +1052,11 @@ function handleAction(action, payload, clientMeta) {
       if (gameState.phase !== "LOBBY") {
         return { ok: false, error: "Pengaturan hanya dapat diubah saat di Lobby." };
       }
+      if ([20, 30, 40, 50, 60].includes(Number(payload.maxPlayers))) {
+        gameState.settings.maxPlayers = Number(payload.maxPlayers);
+      }
       const prevGroupCount = gameState.settings.groupCount;
-      if ([2, 3, 4, 5, 6].includes(Number(payload.groupCount))) {
+      if ([2, 3, 4, 5, 6, 7, 8].includes(Number(payload.groupCount))) {
         if (gameState.teamsLocked && Number(payload.groupCount) !== prevGroupCount) {
           return {
             ok: false,
@@ -969,7 +1071,7 @@ function handleAction(action, payload, clientMeta) {
       if ([0, 15, 20, 30].includes(Number(payload.turnDurationSeconds))) {
         gameState.settings.turnDurationSeconds = Number(payload.turnDurationSeconds);
       }
-      if (["INHERITED", "WASTED"].includes(payload.passInkBehavior)) {
+      if (["PORSI_TETAP", "INHERITED", "WASTED"].includes(payload.passInkBehavior)) {
         gameState.settings.passInkBehavior = payload.passInkBehavior;
       }
       if (typeof payload.fuzzyMatching === "boolean") {
@@ -978,6 +1080,7 @@ function handleAction(action, payload, clientMeta) {
 
       if (!gameState.teamsLocked && prevGroupCount !== gameState.settings.groupCount) {
         rebalanceGroups(false);
+        syncGroupsStructure();
       } else {
         syncGroupsStructure();
         normalizeGroupTurnOrders();
@@ -1061,11 +1164,12 @@ function handleAction(action, payload, clientMeta) {
       if (gameState.phase !== "LOBBY") {
         return { ok: false, error: "Bot hanya bisa ditambahkan saat di Lobby." };
       }
+      const currentMaxPlayers = gameState.settings.maxPlayers || MAX_PLAYERS;
       const count = Math.max(1, Math.min(12, Number(payload.count) || 1));
       let added = 0;
 
       for (let i = 0; i < count; i++) {
-        if (gameState.players.length >= MAX_PLAYERS) break;
+        if (gameState.players.length >= currentMaxPlayers) break;
         const existingNames = new Set(gameState.players.map((p) => p.name));
         const availableBotName =
           BOT_NAMES.find((bn) => !existingNames.has(bn)) ||
@@ -1084,6 +1188,7 @@ function handleAction(action, payload, clientMeta) {
         added++;
       }
 
+      syncGroupsStructure();
       broadcastState();
       return { ok: true, added };
     }
@@ -1155,8 +1260,15 @@ function handleAction(action, payload, clientMeta) {
       const cleaned = rawWords
         .map((w) => String(w || "").trim())
         .filter((w) => w.length >= 2);
+      const multiWord = cleaned.find((w) => /\s/.test(w));
+      if (multiWord) {
+        return {
+          ok: false,
+          error: `Kata "${multiWord}" terdiri dari lebih dari 1 kata. Gunakan cukup 1 kata saja untuk setiap objek.`
+        };
+      }
       if (cleaned.length < 6) {
-        return { ok: false, error: "Word Bank minimal harus berisi 6 kata objek." };
+        return { ok: false, error: "Word Bank minimal harus berisi 6 kata objek (masing-masing 1 kata)." };
       }
       gameState.customWords = cleaned;
       gameState.usedWords.clear();
@@ -1344,12 +1456,15 @@ const server = http.createServer((req, res) => {
         const result = handleAction(data.action, payloadWithDevice, { deviceId });
         const finalPlayerId =
           (result.player && result.player.id) || data.playerId || null;
+        const omitStrokes = data.action === "SUBMIT_GUESS";
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(
           JSON.stringify({
             ...result,
             deviceId,
-            state: buildClientState(data.role || "player", finalPlayerId, deviceId)
+            state: buildClientState(data.role || "player", finalPlayerId, deviceId, {
+              omitStrokes
+            })
           })
         );
       } catch (err) {

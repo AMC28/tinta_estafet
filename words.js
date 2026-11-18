@@ -1,25 +1,24 @@
 // Word Bank Bawaan Bahasa Indonesia & Generator Gambar Bot untuk Tinta Estafet
 
 const DEFAULT_WORDS = [
-  // Hewan
-  "Kucing", "Gajah", "Jerapah", "Kupu-Kupu", "Gurita", "Buaya", "Pinguin", "Kelinci",
-  "Kura-Kura", "Lumba-Lumba", "Burung Hantu", "Ular Kobra", "Kepiting", "Bunglon", "Hiu",
-  "Komodo", "Ayam Jago", "Sapi", "Kuda Laut", "Katak",
-  // Makanan & Minuman
-  "Es Krim", "Bakso", "Nasi Goreng", "Sate Ayam", "Martabak", "Donat", "Semangka",
-  "Pisang", "Durian", "Mie Instan", "Kopi Susu", "Burger", "Pizza", "Kelapa Muda",
-  "Kerupuk", "Permen Lolipop", "Roti Bakar", "Jagung Bakar",
-  // Benda & Kendaraan
-  "Sepeda", "Payung", "Kacamata", "Gitar", "Helikopter", "Kapal Selam", "Lampu Tidur",
-  "Jam Dinding", "Kamera", "Sepatu Roda", "Televisi", "Kipas Angin", "Setrika", "Kompor",
-  "Sapu Lidi", "Layang-Layang", "Balon Udara", "Roket", "Perahu Layar", "Kereta Api",
-  "Truk Pemadam", "Becak", "Bajak", "Kunci Inggris", "Gembok",
-  // Tempat & Alam
-  "Gunung Berapi", "Pulau Kelapa", "Rumah Pohon", "Pelangi", "Air Terjun", "Menara Kembar",
-  "Mercusuar", "Pantai", "Kemah", "Istana Pasir", "Jembatan", "Masjid", "Sawah",
-  // Karakter & Aktivitas
-  "Manusia Salju", "Robot", "Bajak Laut", "Astronot", "Ninja", "Pemadam Kebakaran",
-  "Koki", "Dokter Gigi", "Memancing", "Berenang", "Bermain Bola", "Ulang Tahun"
+  // Hewan (1 Kata)
+  "Kucing", "Gajah", "Jerapah", "Gurita", "Buaya", "Pinguin", "Kelinci",
+  "Penyu", "Kepiting", "Bunglon", "Hiu", "Komodo", "Ayam", "Sapi",
+  "Katak", "Singa", "Harimau", "Zebra", "Panda", "Unta",
+  // Makanan & Minuman (1 Kata)
+  "Bakso", "Martabak", "Donat", "Semangka", "Pisang", "Durian", "Burger",
+  "Pizza", "Kelapa", "Kerupuk", "Permen", "Roti", "Jagung", "Sate",
+  "Nanas", "Mangga", "Stroberi", "Keju", "Tumpeng", "Mie",
+  // Benda & Kendaraan (1 Kata)
+  "Sepeda", "Payung", "Kacamata", "Gitar", "Helikopter", "Kamera", "Televisi",
+  "Setrika", "Kompor", "Roket", "Perahu", "Kereta", "Truk", "Becak",
+  "Gembok", "Lampu", "Jam", "Kipas", "Sapu", "Balon", "Pesawat",
+  "Mobil", "Kunci", "Topi", "Sepatu",
+  // Tempat & Alam (1 Kata)
+  "Gunung", "Pulau", "Pohon", "Pelangi", "Mercusuar", "Pantai", "Kemah",
+  "Istana", "Jembatan", "Masjid", "Sawah", "Rumah", "Matahari", "Kaktus",
+  // Karakter & Profesi (1 Kata)
+  "Robot", "Astronot", "Ninja", "Koki", "Dokter", "Badut", "Raja", "Polisi"
 ];
 
 const BOT_NAMES = [
@@ -27,7 +26,10 @@ const BOT_NAMES = [
   "Bot Dewi", "Bot Eko", "Bot Maya", "Bot Rizky", "Bot Putri",
   "Bot Hendra", "Bot Lestari", "Bot Fajar", "Bot Nisa", "Bot Dimas",
   "Bot Tari", "Bot Wahyu", "Bot Sari", "Bot Andi", "Bot Mega",
-  "Bot Bayu", "Bot Citra", "Bot Gilang", "Bot Wulan"
+  "Bot Bayu", "Bot Citra", "Bot Gilang", "Bot Wulan", "Bot Reza",
+  "Bot Nadya", "Bot Arif", "Bot Bella", "Bot Yoga", "Bot Intan",
+  "Bot Kevin", "Bot Dina", "Bot Bagas", "Bot Salsa", "Bot Daffa",
+  "Bot Tiara", "Bot Farhan", "Bot Ayu", "Bot Galih", "Bot Nabila"
 ];
 
 // Generator goresan (strokes) untuk Bot pada fase menggambar
@@ -87,7 +89,7 @@ function generateBotStrokesForTurn(word, turnIndex, totalTurns, colors) {
       { color: blue, size: 3, inkMultiplier: 1.0, points: makeCirclePoints(400, 420, 220, 20, 0, Math.PI, 16) },
       { color: amber, size: 3, inkMultiplier: 1.0, points: makeLinePoints(530, 120, 500, 120, 5) }
     ]);
-  } else if (wLower.includes("es krim") || wLower.includes("donat") || wLower.includes("burger") || wLower.includes("pizza") || wLower.includes("semangka")) {
+  } else if (wLower.includes("bakso") || wLower.includes("donat") || wLower.includes("burger") || wLower.includes("pizza") || wLower.includes("semangka")) {
     layers.push([
       { color: brown, size: 6, inkMultiplier: 1.6, points: [...makeLinePoints(320, 250, 400, 420, 12), ...makeLinePoints(400, 420, 480, 250, 12), ...makeLinePoints(480, 250, 320, 250, 10)] }
     ]);
