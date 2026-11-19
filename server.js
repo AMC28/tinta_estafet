@@ -1678,13 +1678,19 @@ const server = http.createServer((req, res) => {
           res.end("404 Not Found");
           return;
         }
-        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.writeHead(200, {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "no-cache, no-store, must-revalidate"
+        });
         res.end(indexContent);
       });
       return;
     }
     const ext = path.extname(filePath).toLowerCase();
-    res.writeHead(200, { "Content-Type": MIME_TYPES[ext] || "application/octet-stream" });
+    res.writeHead(200, {
+      "Content-Type": MIME_TYPES[ext] || "application/octet-stream",
+      "Cache-Control": "no-cache, no-store, must-revalidate"
+    });
     res.end(content);
   });
 });
