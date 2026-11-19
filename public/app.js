@@ -225,11 +225,71 @@
     }
   }
 
+  const DEFAULT_FALLBACK_META = {
+    settings: {
+      maxPlayers: 40,
+      groupCount: 4,
+      inkCapacityMode: "STANDAR",
+      turnDurationSeconds: 20,
+      passInkBehavior: "PORSI_TETAP",
+      fuzzyMatching: true
+    },
+    inkCapacityModes: {
+      HEMAT: { ink_per_player: 1000, total_group_ink: 1000, description: "Menantang, butuh efisiensi goresan tinggi" },
+      STANDAR: { ink_per_player: 2000, total_group_ink: 2000, description: "Porsi seimbang untuk setiap pemain" },
+      BANYAK: { ink_per_player: 4000, total_group_ink: 4000, description: "Leluasa untuk detail gambar dan warna" }
+    },
+    drawingTools: {
+      visibility_mode: "OPEN_RELAY",
+      colors: ["#000000", "#EF4444", "#3B82F6", "#10B981", "#F59E0B", "#8B5CF6", "#EC4899", "#92400E"],
+      brush_sizes: [
+        { label: "Tipis", size: 3, ink_multiplier: 1.0 },
+        { label: "Sedang", size: 6, ink_multiplier: 1.6 },
+        { label: "Tebal", size: 11, ink_multiplier: 2.5 }
+      ],
+      eraser_allowed: true,
+      undo_allowed: false
+    }
+  };
+
   function handleStateUpdate(newState) {
     const prevState = client.state;
 
     if (newState && typeof newState.serverTime === "number") {
       client.serverTimeOffset = newState.serverTime - Date.now();
+    }
+
+    // Pertahankan field statis yang tidak dikirim pada state ringan (strokesOmitted: true)
+    if (newState) {
+      if (newState.settings === undefined) {
+        newState.settings = (prevState && prevState.settings) || DEFAULT_FALLBACK_META.settings;
+      }
+      if (newState.inkCapacityModes === undefined) {
+        newState.inkCapacityModes =
+          (prevState && prevState.inkCapacityModes) || DEFAULT_FALLBACK_META.inkCapacityModes;
+      }
+      if (newState.drawingTools === undefined) {
+        newState.drawingTools =
+          (prevState && prevState.drawingTools) || DEFAULT_FALLBACK_META.drawingTools;
+      }
+      if (newState.localIPs === undefined && prevState) {
+        newState.localIPs = prevState.localIPs;
+      }
+      if (newState.port === undefined && prevState) {
+        newState.port = prevState.port;
+      }
+    }
+
+    // Resolusi group.members yang berisi array ID pemain dari newState.players agar tidak dikirim dua kali
+    if (newState && Array.isArray(newState.groups) && Array.isArray(newState.players)) {
+      const playerMap = new Map(newState.players.map((p) => [p.id, p]));
+      newState.groups.forEach((g) => {
+        if (Array.isArray(g.members)) {
+          g.members = g.members
+            .map((m) => (typeof m === "string" ? playerMap.get(m) : m))
+            .filter(Boolean);
+        }
+      });
     }
 
     // Jika server mengirim state ringan (strokesOmitted),

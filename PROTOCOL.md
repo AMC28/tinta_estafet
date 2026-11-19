@@ -650,15 +650,7 @@ Tombol *"🗑️ Reset Semua"* di halaman `LOBBY`: mengeluarkan (kick) semua pem
         "countdownRemainingSec": 0,
         "turnRemainingSec": 0,
         "members": [
-          {
-            "id": "3f9a1c02-7a8e-4e1a-9b24-112233445566",
-            "name": "Budi",
-            "deviceId": "dev-9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
-            "groupId": 1,
-            "turnOrder": 1,
-            "isBot": false,
-            "connected": true
-          }
+          "3f9a1c02-7a8e-4e1a-9b24-112233445566"
         ],
         "strokes": [
           {
@@ -704,9 +696,15 @@ Tombol *"🗑️ Reset Semua"* di halaman `LOBBY`: mengeluarkan (kick) semua pem
 ```
 
 #### B. `STATE_UPDATE` Ringan (`omitStrokes: true`)
-Untuk mencegah lonjakan ukuran payload (130–257 KB per klien) saat pergantian giliran dan tebakan, server menggunakan `omitStrokes: true` (`state.strokesOmitted: true`, di mana properti `strokes` pada seluruh objek di `state.groups` bernilai `undefined` / tidak diserialisasi) pada kondisi berikut:
-1. **Selama fase `DRAWING`:** seluruh broadcast `STATE_UPDATE` akibat `PASS_TURN`, `GM_SKIP_MEMBER_TURN`, habisnya tinta/waktu giliran, transisi `COUNTDOWN` $\rightarrow$ `DRAWING` di game loop (`200 ms`), `FORCE_FINISH_DRAWING`, serta `JOIN_PLAYER` / `KICK_PLAYER`. Klien sudah menerima goresan secara *real-time* melalui `STROKE_STREAM` dan mempertahankan `g.strokes` di memori browser (`public/app.js` baris `235–257`).
-2. **Selama fase `GUESSING`:** saat peserta mengirim tebakan (`SUBMIT_GUESS`) atau Game Master mengubah Clue (`TOGGLE_CLUE`, `ADD_CLUE_LETTER`).
+Untuk mencegah lonjakan ukuran payload saat pergantian giliran dan tebakan, server mengirimkan state ringan (`state.strokesOmitted: true`) dengan pemangkasan data berikut:
+1. **`strokes` Dihilangkan:** Properti `strokes` pada seluruh objek di `state.groups` bernilai `undefined` (tidak diserialisasi). Klien mempertahankan `g.strokes` yang sudah ada di memori browser (`public/app.js` baris `295–316`).
+2. **Metadata Statis Dihilangkan (`includeStaticMeta: false`):** Properti `settings`, `inkCapacityModes`, `drawingTools`, `localIPs`, dan `port` tidak disertakan (`undefined`) pada state ringan, **kecuali** pada balasan `IDENTIFY` (`omitStrokes: false`), `GET /api/state`, dan saat terjadi **perubahan fase** (`phaseChanged: true`). Klien otomatis memakai nilai terakhir yang tersimpan di `client.state` (`public/app.js` baris `262–281`).
+3. **Deduplikasi Data Pemain (`group.members`):** Di seluruh `STATE_UPDATE` (baik penuh maupun ringan), `group.members` hanya berisi **array ID pemain** (`string[]`, contoh: `["3f9a1c02-..."]`). Data lengkap pemain hanya dikirim satu kali di `state.players`, lalu klien me-resolusi `g.members` dari `state.players` di memori (`public/app.js` baris `283–293`).
+4. **Pembatasan `guessFeed`:** Pada state ringan (`omitStrokes: true`), `state.guessFeed` dipotong maksimal **20 item terbaru** (`.slice(0, 20)`), sedangkan di memori server dan pada state penuh disimpan hingga 60 item.
+
+Kondisi yang menggunakan `omitStrokes: true`:
+1. **Selama fase `DRAWING`:** seluruh broadcast `STATE_UPDATE` akibat `PASS_TURN`, `GM_SKIP_MEMBER_TURN`, habisnya tinta/waktu giliran, transisi `COUNTDOWN` $\rightarrow$ `DRAWING` di game loop (`200 ms`), `FORCE_FINISH_DRAWING`, serta `JOIN_PLAYER` / `KICK_PLAYER`.
+2. **Selama fase `GUESSING` (Coalesced 300 ms):** saat peserta mengirim tebakan (`SUBMIT_GUESS`) atau Game Master mengubah Clue (`TOGGLE_CLUE`, `ADD_CLUE_LETTER`), broadcast digabungkan melalui `scheduleCoalescedBroadcast({ omitStrokes: true })` sehingga server mengirim **paling banyak 1 `broadcastState` setiap 300 ms**.
 3. **Seluruh HTTP Response `POST /api/action`:** response JSON dari `POST /api/action` selalu menggunakan `omitStrokes: true`.
 4. **Pesan `STATE_UPDATE` awal saat handshake `upgrade` WebSocket** (sebelum klien mengirim `IDENTIFY`).
 
@@ -862,12 +860,14 @@ Dikirim via WebSocket ke klien yang dikeluarkan lewat `KICK_PLAYER` atau `KICK_A
 ---
 
 ### 3.3 Frekuensi Broadcast & Target Penerima
-1. **`broadcastState(options)` (`server.js` baris `990–997`):**
-   - **Ke Siapa:** Ke **seluruh** socket di `wsClients`, namun payload JSON dibuat spesifik per penerima lewat `buildClientState(meta.role, meta.playerId, meta.deviceId, options)` agar `secretWord`, `strokes`, dan `guessFeed` (`isClose`) tetap terfilter sesuai hak akses masing-masing klien.
-   - **Seberapa Sering:**
-     - Setiap kali ada action (`JOIN_PLAYER`, `UPDATE_SETTINGS`, `PASS_TURN`, `SUBMIT_GUESS`, `TOGGLE_CLUE`, dll.).
-     - Di dalam `startServerGameLoop` (interval `200 ms`, `server.js` baris `764–790`): server **tidak** melakukan broadcast setiap 200 ms, melainkan **hanya ketika terjadi transisi status** di salah satu grup (saat `now >= group.countdownEndAt` mengubah `COUNTDOWN` $\rightarrow$ `DRAWING`, atau saat `now >= group.turnEndAt` memicu habis waktu giliran). Hitung mundur detik di layar dijalankan secara lokal oleh browser tiap `250 ms` menggunakan selisih `serverTimeOffset` terhadap `countdownEndAt` dan `turnEndAt`.
-2. **`broadcastStroke(groupId, segment, inkInfo)` (`server.js` baris `999–1011`):**
+1. **`broadcastState(options)` & `scheduleCoalescedBroadcast(options)` (`server.js` baris `1005–1031`):**
+   - **Ke Siapa:** Ke **seluruh** socket di `wsClients`, namun payload JSON dibuat spesifik per penerima lewat `buildClientState(meta.role, meta.playerId, meta.deviceId, buildOpts)` agar `secretWord`, `strokes`, dan `guessFeed` (`isClose`) tetap terfilter sesuai hak akses masing-masing klien.
+   - **Coalescing `300 ms` pada Fase `GUESSING`:**
+     - Saat banyak request `SUBMIT_GUESS`, `TOGGLE_CLUE`, atau `ADD_CLUE_LETTER` masuk berdekatan, server memanggil `scheduleCoalescedBroadcast({ omitStrokes: true })` yang menggabungkan pembaruan tersebut dan mengirim **paling banyak 1 `broadcastState` setiap `300 ms`**.
+     - Response HTTP `POST /api/action` untuk `SUBMIT_GUESS` tetap langsung dikembalikan ke penebak (`isCorrect`, `isClose`, `rank`, `pointsEarned`) tanpa menunggu timer `300 ms`.
+     - Jika terjadi `broadcastState()` langsung (seperti `REVEAL_CURRENT_GROUP`), timer coalescing yang sedang tertunda otomatis dibatalkan (`clearTimeout`) dan di-*flush* seketika.
+   - **Di dalam `startServerGameLoop` (interval `200 ms`, `server.js` baris `768–795`):** server **tidak** melakukan broadcast setiap 200 ms, melainkan **hanya ketika terjadi transisi status** di salah satu grup (saat `now >= group.countdownEndAt` mengubah `COUNTDOWN` $\rightarrow$ `DRAWING`, atau saat `now >= group.turnEndAt` memicu habis waktu giliran) menggunakan `broadcastState({ omitStrokes: true })`. Hitung mundur detik di layar dijalankan secara lokal oleh browser tiap `250 ms` menggunakan selisih `serverTimeOffset` terhadap `countdownEndAt` dan `turnEndAt`.
+2. **`broadcastStroke(groupId, segment, inkInfo)` (`server.js` baris `1033–1045`):**
    - **Ke Siapa:** **Hanya** ke socket milik anggota grup `groupId` (`viewer.groupId === groupId`) dan socket `game_master`. Anggota grup lain tidak menerima paket ini.
    - **Seberapa Sering:** Setiap kali pemain aktif menggerakkan kursor/jari sejauh $\ge 2$ piksel di atas kanvas.
 

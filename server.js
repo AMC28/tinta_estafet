@@ -82,6 +82,12 @@ const wsClients = new Map();
 let gameLoopTimer = null;
 let wsKeepAliveTimer = null;
 
+// Coalescing broadcast untuk aksi frekuensi tinggi (SUBMIT_GUESS, TOGGLE_CLUE, ADD_CLUE_LETTER):
+// maksimal 1 broadcastState per 300 ms
+const COALESCE_BROADCAST_MS = 300;
+let coalescedBroadcastTimer = null;
+let lastBroadcastPhase = "LOBBY";
+
 // Cache alamat IP Lokal (LAN) selama 30 detik agar tidak membebani CPU saat broadcast ke 40 pemain
 let cachedLocalIPs = null;
 let cachedLocalIPsAt = 0;
@@ -669,8 +675,8 @@ function handlePlayerGuess(playerId, rawText) {
       gameState.guessFeed.length = 60;
     }
 
-    // Saat pemain menebak, gambar di kanvas tidak berubah -> broadcast state ringan tanpa strokes!
-    broadcastState({ omitStrokes: true });
+    // Coalesce broadcast (maksimal 1 broadcastState per 300 ms saat banyak tebakan masuk bersamaan)
+    scheduleCoalescedBroadcast({ omitStrokes: true });
     return {
       ok: true,
       isCorrect: true,
@@ -696,8 +702,8 @@ function handlePlayerGuess(playerId, rawText) {
     gameState.guessFeed.length = 60;
   }
 
-  // Broadcast state ringan tanpa mengirim ulang ribuan titik gambar
-  broadcastState({ omitStrokes: true });
+  // Coalesce broadcast ringan (maksimal 1 broadcastState per 300 ms)
+  scheduleCoalescedBroadcast({ omitStrokes: true });
   return { ok: true, isCorrect: false, isFuzzyCorrect: false, isClose };
 }
 
@@ -809,16 +815,18 @@ function startServerGameLoop() {
 // Membuat payload state yang aman sesuai Role & Grup penerima (agar kata rahasia grup lain tidak bocor)
 function buildClientState(role, playerId, deviceId = null, options = {}) {
   const omitStrokes = Boolean(options && options.omitStrokes);
+  const includeStaticMeta = !omitStrokes || Boolean(options && options.phaseChanged);
   let viewer = gameState.players.find((p) => p.id === playerId) || null;
   if (!viewer && deviceId) {
     viewer = gameState.players.find((p) => !p.isBot && p.deviceId === deviceId) || null;
   }
   const viewerGroupId = viewer ? viewer.groupId : null;
   const now = Date.now();
-  const localIPs = getLocalIPs();
+  const localIPs = includeStaticMeta ? getLocalIPs() : undefined;
 
   const sanitizedGroups = gameState.groups.map((g, idx) => {
     const members = getGroupMembers(g.id);
+    const memberIds = members.map((m) => m.id);
     const activeMember = members[g.currentTurnIndex] || null;
 
     // Kapan kata rahasia grup boleh terlihat oleh klien ini?
@@ -907,7 +915,7 @@ function buildClientState(role, playerId, deviceId = null, options = {}) {
             ? null
             : Math.max(0, Math.ceil((g.turnEndAt - now) / 1000))
           : 0,
-      members,
+      members: memberIds,
       strokes: omitStrokes ? undefined : canSeeCanvas ? g.strokes : [],
       correctGuessers: g.correctGuessers,
       scoreBreakdown: g.scoreBreakdown
@@ -915,12 +923,16 @@ function buildClientState(role, playerId, deviceId = null, options = {}) {
   });
 
   // Filter guessFeed: tebakan yang "hampir benar / mendekati" (isClose) HANYA boleh terlihat oleh peserta itu sendiri
-  const visibleGuessFeed = gameState.guessFeed.filter((item) => {
+  const filteredGuessFeed = gameState.guessFeed.filter((item) => {
     if (item.isClose) {
       return Boolean(viewer && item.playerId && item.playerId === viewer.id);
     }
     return true;
   });
+  // Pada state ringan (omitStrokes: true), batasi guessFeed maksimal 20 item terbaru
+  const visibleGuessFeed = omitStrokes
+    ? filteredGuessFeed.slice(0, 20)
+    : filteredGuessFeed;
 
   const activeGroupObj = gameState.groups[gameState.activeGuessGroupIndex];
   const activeSecretChars = Array.from(
@@ -938,9 +950,9 @@ function buildClientState(role, playerId, deviceId = null, options = {}) {
     teamsLocked: Boolean(gameState.teamsLocked),
     strokesOmitted: omitStrokes,
     maxPlayers: gameState.settings.maxPlayers || MAX_PLAYERS,
-    settings: gameState.settings,
-    inkCapacityModes: INK_CAPACITY_MODES,
-    drawingTools: DRAWING_TOOLS,
+    settings: includeStaticMeta ? gameState.settings : undefined,
+    inkCapacityModes: includeStaticMeta ? INK_CAPACITY_MODES : undefined,
+    drawingTools: includeStaticMeta ? DRAWING_TOOLS : undefined,
     players: gameState.players,
     groups: sanitizedGroups,
     boundPlayer: viewer && !viewer.isBot ? viewer : null,
@@ -951,7 +963,7 @@ function buildClientState(role, playerId, deviceId = null, options = {}) {
     customWordsCount: gameState.customWords.length,
     customWords: role === "game_master" ? gameState.customWords : undefined,
     localIPs,
-    port: PORT,
+    port: includeStaticMeta ? PORT : undefined,
     serverTime: now
   };
 }
@@ -991,12 +1003,31 @@ function sendWsMessage(ws, obj) {
 }
 
 function broadcastState(options = {}) {
+  if (coalescedBroadcastTimer) {
+    clearTimeout(coalescedBroadcastTimer);
+    coalescedBroadcastTimer = null;
+  }
+  const phaseChanged =
+    Boolean(options && options.phaseChanged) || gameState.phase !== lastBroadcastPhase;
+  lastBroadcastPhase = gameState.phase;
+  const buildOpts = { ...options, phaseChanged };
+
   for (const [ws, meta] of wsClients.entries()) {
     sendWsMessage(ws, {
       type: "STATE_UPDATE",
-      state: buildClientState(meta.role, meta.playerId, meta.deviceId, options)
+      state: buildClientState(meta.role, meta.playerId, meta.deviceId, buildOpts)
     });
   }
+}
+
+// Menggabungkan (coalesce) banyak broadcast ringan yang berdekatan (SUBMIT_GUESS, TOGGLE_CLUE, ADD_CLUE_LETTER)
+// agar server mengirim paling banyak 1 broadcastState setiap 300 ms
+function scheduleCoalescedBroadcast(options = { omitStrokes: true }) {
+  if (coalescedBroadcastTimer) return;
+  coalescedBroadcastTimer = setTimeout(() => {
+    coalescedBroadcastTimer = null;
+    broadcastState(options);
+  }, COALESCE_BROADCAST_MS);
 }
 
 function broadcastStroke(groupId, segment, inkInfo) {
@@ -1444,7 +1475,7 @@ function handleAction(action, payload, clientMeta) {
         typeof payload.active === "boolean" ? payload.active : !gameState.clueActive;
       gameState.clueActive = nextActive;
       gameState.clueRevealedCount = 1;
-      broadcastState({ omitStrokes: true });
+      scheduleCoalescedBroadcast({ omitStrokes: true });
       return {
         ok: true,
         clueActive: gameState.clueActive,
@@ -1468,7 +1499,7 @@ function handleAction(action, payload, clientMeta) {
       } else if (gameState.clueRevealedCount < maxClueLetters) {
         gameState.clueRevealedCount += 1;
       }
-      broadcastState({ omitStrokes: true });
+      scheduleCoalescedBroadcast({ omitStrokes: true });
       return {
         ok: true,
         clueActive: gameState.clueActive,
