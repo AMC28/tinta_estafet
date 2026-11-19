@@ -255,6 +255,11 @@
     // Jika sedang di fase DRAWING dan struktur giliran/fase tidak berubah, update elemen secara in-place
     // agar pemain yang sedang menekan jari/mouse di kanvas tidak terputus goresannya
     const newViewKey = computeViewKey(newState);
+    // Jangan re-render halaman ENTRY jika sudah tampil, agar ketikan nama/klik tombol tidak terputus saat ada STATE_UPDATE
+    if (client.renderedViewKey === "ENTRY" && newViewKey === "ENTRY") {
+      return;
+    }
+
     if (
       prevState &&
       client.renderedViewKey === newViewKey &&

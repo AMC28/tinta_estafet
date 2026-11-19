@@ -153,13 +153,6 @@ body {
     order: -1;
   }
 
-  .toast-container {
-    top: 14px;
-    bottom: auto;
-    right: 12px;
-    left: 12px;
-  }
-
   .mobile-only-word-pill {
     display: inline-flex !important;
   }
@@ -548,6 +541,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  pointer-events: none;
 }
 
 .toast {
@@ -559,6 +553,16 @@ body {
   box-shadow: var(--shadow-lg);
   font-size: 0.88rem;
   font-weight: 600;
+  pointer-events: auto;
+}
+
+@media (max-width: 900px) {
+  .toast-container {
+    top: 14px;
+    bottom: auto;
+    right: 12px;
+    left: 12px;
+  }
 }
 
 /* Modal */
