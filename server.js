@@ -1031,7 +1031,8 @@ const GM_ONLY_ACTIONS = new Set([
   "SHOW_LEADERBOARD",
   "NEXT_ROUND",
   "RETURN_TO_LOBBY",
-  "RESET_GAME"
+  "RESET_GAME",
+  "KICK_ALL_PLAYERS"
 ]);
 
 // Handler untuk seluruh Action dari Player maupun Game Master
@@ -1534,7 +1535,7 @@ function handleAction(action, payload, clientMeta) {
     }
 
     case "RESET_GAME": {
-      // Reset Semua: kembalikan ke Ronde 1, nolkan semua skor akumulasi, buka kunci tim, dan acak ulang tim
+      // Reset di Leaderboard: kembalikan ke Ronde 1, nolkan semua skor akumulasi, buka kunci tim, dan acak ulang tim tanpa meng-kick peserta
       gameState.roundNumber = 1;
       gameState.teamsLocked = false;
       gameState.accumulatedScores = {};
@@ -1546,6 +1547,36 @@ function handleAction(action, payload, clientMeta) {
       gameState.groups = [];
       syncGroupsStructure();
       rebalanceGroups(true);
+      broadcastState();
+      return { ok: true };
+    }
+
+    case "KICK_ALL_PLAYERS": {
+      // Tombol Reset Semua di Lobby: keluarkan (kick) semua orang & Bot dari room, reset skor & ronde ke awal
+      gameState.players = [];
+      gameState.roundNumber = 1;
+      gameState.teamsLocked = false;
+      gameState.accumulatedScores = {};
+      gameState.usedWords.clear();
+      gameState.phase = "LOBBY";
+      gameState.guessFeed = [];
+      gameState.activeGuessGroupIndex = 0;
+      gameState.clueActive = false;
+      gameState.clueRevealedCount = 1;
+      gameState.groups = [];
+      syncGroupsStructure();
+
+      for (const [ws, meta] of wsClients.entries()) {
+        if (meta.role !== "game_master") {
+          meta.playerId = null;
+          meta.role = null;
+          sendWsMessage(ws, {
+            type: "PLAYER_KICKED",
+            message: "Room telah di-reset oleh Game Master."
+          });
+        }
+      }
+
       broadcastState();
       return { ok: true };
     }

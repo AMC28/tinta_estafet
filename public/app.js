@@ -800,7 +800,7 @@
                       ? `<button id="removeBotsBtn" class="btn btn-rose btn-sm">Hapus Bot</button>`
                       : ""
                   }
-                  <button id="resetAllLobbyBtn" class="btn btn-rose btn-sm" title="Reset skor, kembalikan ke Ronde 1, dan acak ulang semua tim">
+                  <button id="resetAllLobbyBtn" class="btn btn-rose btn-sm" title="Keluarkan (kick) semua pemain dari room dan reset dari awal">
                     🗑️ Reset Semua
                   </button>
                 </div>
@@ -867,10 +867,12 @@
       });
 
       document.getElementById("resetAllLobbyBtn").addEventListener("click", async () => {
-        if (!confirm("Reset semua skor ke 0, kembali ke Ronde 1, dan acak ulang tim?")) return;
-        const res = await sendAction("RESET_GAME");
+        if (!confirm("Keluarkan (kick) semua orang dari room dan reset permainan ke awal?")) return;
+        const res = await sendAction("KICK_ALL_PLAYERS");
         if (res.ok) {
-          showToast("Permainan berhasil di-reset ke Ronde 1 & tim diacak ulang!", "#10b981");
+          showToast("Semua orang telah dikeluarkan dari room & Lobby berhasil di-reset!", "#10b981");
+        } else {
+          showToast(res.error || "Gagal mereset room", "#f43f5e");
         }
       });
 
