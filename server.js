@@ -75,8 +75,95 @@ const gameState = {
   accumulatedScores: {} // { [groupId]: number } untuk multi-ronde
 };
 
-// WebSocket Clients: Map<ws, { clientId, role, playerId }>
+// WebSocket Clients: Map<ws, { clientId, role, playerId, deviceId, ip }>
 const wsClients = new Map();
+
+// Token rahasia per pemain: Map<playerId, playerToken>
+const playerTokens = new Map();
+
+// Pembatas percobaan PIN GM per IP: maksimal 5 gagal dalam 10 menit -> kunci 10 menit
+const GM_PIN_MAX_ATTEMPTS = 5;
+const GM_PIN_WINDOW_MS = 10 * 60 * 1000;
+const GM_PIN_LOCK_MS = 10 * 60 * 1000;
+const gmPinAttemptsByIp = new Map(); // Map<ip, { count, firstFailedAt, lockedUntil }>
+
+function getClientIp(req) {
+  if (!req) return "unknown";
+  const xff = req.headers && req.headers["x-forwarded-for"];
+  if (xff) {
+    const firstIp = String(xff).split(",")[0].trim();
+    if (firstIp) return firstIp.replace(/^::ffff:/, "");
+  }
+  const rawIp =
+    (req.socket && req.socket.remoteAddress) ||
+    (req.connection && req.connection.remoteAddress) ||
+    "unknown";
+  return String(rawIp).trim().replace(/^::ffff:/, "");
+}
+
+function verifyGmPinWithRateLimit(ip, candidatePin) {
+  const now = Date.now();
+  const key = String(ip || "unknown");
+  let rec = gmPinAttemptsByIp.get(key);
+
+  if (rec) {
+    if (rec.lockedUntil && now < rec.lockedUntil) {
+      const remMin = Math.max(1, Math.ceil((rec.lockedUntil - now) / 60000));
+      return {
+        ok: false,
+        locked: true,
+        statusCode: 429,
+        error: `Terlalu banyak percobaan PIN. Coba lagi dalam ${remMin} menit.`
+      };
+    }
+    if (
+      (rec.lockedUntil && now >= rec.lockedUntil) ||
+      (!rec.lockedUntil && now - rec.firstFailedAt >= GM_PIN_WINDOW_MS)
+    ) {
+      gmPinAttemptsByIp.delete(key);
+      rec = null;
+    }
+  }
+
+  const pinStr = String(candidatePin || "").trim();
+  if (pinStr === GM_DEFAULT_PIN) {
+    gmPinAttemptsByIp.delete(key);
+    return { ok: true, locked: false, statusCode: 200 };
+  }
+
+  if (!rec) {
+    rec = { count: 1, firstFailedAt: now, lockedUntil: 0 };
+  } else {
+    rec.count += 1;
+  }
+
+  if (rec.count >= GM_PIN_MAX_ATTEMPTS) {
+    rec.lockedUntil = now + GM_PIN_LOCK_MS;
+    gmPinAttemptsByIp.set(key, rec);
+    const remMin = Math.max(1, Math.ceil((rec.lockedUntil - now) / 60000));
+    return {
+      ok: false,
+      locked: true,
+      statusCode: 429,
+      error: `Terlalu banyak percobaan PIN. Coba lagi dalam ${remMin} menit.`
+    };
+  }
+
+  gmPinAttemptsByIp.set(key, rec);
+  return {
+    ok: false,
+    locked: false,
+    statusCode: 200,
+    error: "PIN Game Master salah!"
+  };
+}
+
+function verifyPlayerIdentity(playerId, candidateToken) {
+  if (!playerId || !candidateToken) return false;
+  const expected = playerTokens.get(String(playerId));
+  if (!expected) return false;
+  return expected === String(candidateToken).trim();
+}
 
 // Interval Timer Server (100ms tick untuk akurasi waktu & aksi Bot)
 let gameLoopTimer = null;
@@ -944,6 +1031,21 @@ function buildClientState(role, playerId, deviceId = null, options = {}) {
     Math.min(activeMaxClueLetters, Number(gameState.clueRevealedCount) || 1)
   );
 
+  // Jangan sertakan deviceId pemain lain di state.players
+  const sanitizedPlayers = gameState.players.map((p) => ({
+    id: p.id,
+    name: p.name,
+    groupId: p.groupId,
+    turnOrder: p.turnOrder,
+    isBot: Boolean(p.isBot),
+    connected: Boolean(p.connected)
+  }));
+
+  const isOwnBoundViewer =
+    viewer &&
+    !viewer.isBot &&
+    ((deviceId && viewer.deviceId === deviceId) || Boolean(options && options.tokenVerified));
+
   return {
     phase: gameState.phase,
     roundNumber: gameState.roundNumber,
@@ -953,9 +1055,19 @@ function buildClientState(role, playerId, deviceId = null, options = {}) {
     settings: includeStaticMeta ? gameState.settings : undefined,
     inkCapacityModes: includeStaticMeta ? INK_CAPACITY_MODES : undefined,
     drawingTools: includeStaticMeta ? DRAWING_TOOLS : undefined,
-    players: gameState.players,
+    players: sanitizedPlayers,
     groups: sanitizedGroups,
-    boundPlayer: viewer && !viewer.isBot ? viewer : null,
+    boundPlayer: isOwnBoundViewer
+      ? {
+          id: viewer.id,
+          name: viewer.name,
+          deviceId: viewer.deviceId,
+          groupId: viewer.groupId,
+          turnOrder: viewer.turnOrder,
+          isBot: false,
+          connected: Boolean(viewer.connected)
+        }
+      : null,
     activeGuessGroupIndex: gameState.activeGuessGroupIndex,
     clueActive: Boolean(gameState.clueActive),
     clueRevealedCount: activeClueRevealedCount,
@@ -1072,17 +1184,34 @@ const GM_ONLY_ACTIONS = new Set([
 // Handler untuk seluruh Action dari Player maupun Game Master
 function handleAction(action, payload, clientMeta) {
   if (GM_ONLY_ACTIONS.has(action)) {
-    const isVerifiedGM = Boolean(
+    const alreadyWsGM = Boolean(
       clientMeta &&
-        (clientMeta.role === "game_master" ||
-          (clientMeta.gmPin && clientMeta.gmPin === GM_DEFAULT_PIN))
+        clientMeta.wsAuthenticatedGM &&
+        !(clientMeta && clientMeta.gmPin) &&
+        !(payload && (payload.gmPin || payload.pin))
     );
-    if (!isVerifiedGM) {
-      return {
-        ok: false,
-        requireGmAuth: true,
-        error: "Akses ditolak. Aksi ini khusus Game Master (silakan login ulang dengan PIN terbaru)."
-      };
+    if (!alreadyWsGM) {
+      const candidatePin =
+        (clientMeta && clientMeta.gmPin) ||
+        (payload && (payload.gmPin || payload.pin)) ||
+        "";
+      const pinCheck = verifyGmPinWithRateLimit(
+        clientMeta ? clientMeta.ip : "unknown",
+        candidatePin
+      );
+      if (!pinCheck.ok) {
+        return {
+          ok: false,
+          statusCode: pinCheck.statusCode,
+          requireGmAuth: true,
+          error: pinCheck.locked
+            ? pinCheck.error
+            : "Akses ditolak. Aksi ini khusus Game Master (silakan login ulang dengan PIN terbaru)."
+        };
+      }
+      if (clientMeta) {
+        clientMeta.role = "game_master";
+      }
     }
   }
 
@@ -1092,13 +1221,17 @@ function handleAction(action, payload, clientMeta) {
       const deviceId = String(
         payload.deviceId || (clientMeta && clientMeta.deviceId) || ""
       ).trim();
+      const candidateToken =
+        (payload && payload.playerToken) ||
+        (clientMeta && clientMeta.playerToken) ||
+        "";
 
-      // Cek apakah perangkat (deviceId) atau playerId ini sudah terdaftar sebagai pemain (1 Device = 1 Orang)
+      // Cek apakah perangkat (deviceId) ini sudah terdaftar sebagai pemain (1 Device = 1 Orang)
       let player = null;
       if (deviceId) {
         player = gameState.players.find((p) => !p.isBot && p.deviceId === deviceId) || null;
       }
-      if (!player && payload.playerId) {
+      if (!player && payload.playerId && verifyPlayerIdentity(payload.playerId, candidateToken)) {
         player = gameState.players.find((p) => !p.isBot && p.id === payload.playerId) || null;
       }
 
@@ -1117,30 +1250,48 @@ function handleAction(action, payload, clientMeta) {
           isBot: false,
           connected: true
         };
+        const newToken = crypto.randomUUID();
+        playerTokens.set(player.id, newToken);
         gameState.players.push(player);
         assignNewPlayerToBalancedGroup(player);
         syncGroupsStructure();
       } else {
-        // Perangkat sudah terdaftar sebagai pemain -> gunakan pemain yang sama (tidak boleh buat pemain ke-2)
+        // Perangkat sudah terdaftar sebagai pemain -> gunakan pemain & token yang sama (reconnect)
         if (deviceId && !player.deviceId) {
           player.deviceId = deviceId;
+        }
+        if (!playerTokens.has(player.id)) {
+          playerTokens.set(player.id, crypto.randomUUID());
         }
         player.connected = true;
       }
 
+      const token = playerTokens.get(player.id);
       if (clientMeta) {
         clientMeta.role = "player";
         clientMeta.playerId = player.id;
+        clientMeta.playerToken = token;
         if (player.deviceId) clientMeta.deviceId = player.deviceId;
       }
       broadcastState({ omitStrokes: true });
-      return { ok: true, player };
+      return { ok: true, playerToken: token, player };
     }
 
     case "AUTH_GM": {
-      const pin = String(payload.pin || "").trim();
-      if (pin !== GM_DEFAULT_PIN) {
-        return { ok: false, error: "PIN Game Master salah!" };
+      const candidatePin =
+        payload.pin !== undefined
+          ? payload.pin
+          : (clientMeta && clientMeta.gmPin) || "";
+      const pinCheck = verifyGmPinWithRateLimit(
+        clientMeta ? clientMeta.ip : "unknown",
+        candidatePin
+      );
+      if (!pinCheck.ok) {
+        return {
+          ok: false,
+          statusCode: pinCheck.statusCode,
+          error: pinCheck.error
+        };
       }
       // Jika perangkat Admin sebelumnya sempat masuk sebagai pemain di Lobby, hapus agar tidak menjadi pemain kosong
       const gmDeviceId = String(
@@ -1148,17 +1299,20 @@ function handleAction(action, payload, clientMeta) {
       ).trim();
       if (gameState.phase === "LOBBY" && (gmDeviceId || payload.playerId)) {
         const beforeLen = gameState.players.length;
-        gameState.players = gameState.players.filter(
-          (p) =>
+        gameState.players = gameState.players.filter((p) => {
+          const keep =
             p.isBot ||
-            (p.id !== payload.playerId && (!gmDeviceId || p.deviceId !== gmDeviceId))
-        );
+            (p.id !== payload.playerId && (!gmDeviceId || p.deviceId !== gmDeviceId));
+          if (!keep) playerTokens.delete(p.id);
+          return keep;
+        });
         if (gameState.players.length !== beforeLen) {
           normalizeGroupTurnOrders();
         }
       }
       if (clientMeta) {
         clientMeta.role = "game_master";
+        clientMeta.wsAuthenticatedGM = true;
         clientMeta.playerId = null;
       }
       broadcastState({ omitStrokes: true });
@@ -1335,11 +1489,13 @@ function handleAction(action, payload, clientMeta) {
       const kickedIndex = oldMembers.findIndex((p) => p.id === targetId);
 
       gameState.players = gameState.players.filter((p) => p.id !== targetId);
+      playerTokens.delete(targetId);
 
       // Beritahu browser pemain yang di-kick melalui WebSocket agar tidak auto-rejoin
       for (const [ws, meta] of wsClients.entries()) {
         if (meta.playerId === targetId) {
           meta.playerId = null;
+          meta.playerToken = null;
           meta.role = null;
           sendWsMessage(ws, {
             type: "PLAYER_KICKED",
@@ -1405,6 +1561,13 @@ function handleAction(action, payload, clientMeta) {
     }
 
     case "DRAW_STROKE": {
+      const candidateToken =
+        (payload && payload.playerToken) ||
+        (clientMeta && clientMeta.reqPlayerToken) ||
+        "";
+      if (!verifyPlayerIdentity(payload.playerId, candidateToken)) {
+        return { ok: false, error: "Identitas pemain tidak valid." };
+      }
       const ok = applyStrokeSegment(
         Number(payload.groupId),
         payload.playerId,
@@ -1414,6 +1577,25 @@ function handleAction(action, payload, clientMeta) {
     }
 
     case "PASS_TURN": {
+      const candidateToken =
+        (payload && payload.playerToken) ||
+        (clientMeta && clientMeta.reqPlayerToken) ||
+        "";
+      if (!verifyPlayerIdentity(payload.playerId, candidateToken)) {
+        return { ok: false, error: "Identitas pemain tidak valid." };
+      }
+      if (gameState.phase !== "DRAWING") {
+        return { ok: false, error: "Pass giliran hanya dapat dilakukan saat fase menggambar." };
+      }
+      const group = gameState.groups.find((g) => g.id === Number(payload.groupId));
+      if (!group || group.status === "FINISHED") {
+        return { ok: false, error: "Grup sudah selesai menggambar." };
+      }
+      const members = getGroupMembers(group.id);
+      const activePlayer = members[group.currentTurnIndex];
+      if (!activePlayer || activePlayer.id !== payload.playerId) {
+        return { ok: false, error: "Bukan giliranmu untuk menggambar." };
+      }
       handlePassTurn(Number(payload.groupId), payload.playerId, true);
       return { ok: true };
     }
@@ -1464,6 +1646,13 @@ function handleAction(action, payload, clientMeta) {
     }
 
     case "SUBMIT_GUESS": {
+      const candidateToken =
+        (payload && payload.playerToken) ||
+        (clientMeta && clientMeta.reqPlayerToken) ||
+        "";
+      if (!verifyPlayerIdentity(payload.playerId, candidateToken)) {
+        return { ok: false, error: "Identitas pemain tidak valid." };
+      }
       return handlePlayerGuess(payload.playerId, payload.text);
     }
 
@@ -1588,6 +1777,7 @@ function handleAction(action, payload, clientMeta) {
     case "KICK_ALL_PLAYERS": {
       // Tombol Reset Semua di Lobby: keluarkan (kick) semua orang & Bot dari room, reset skor & ronde ke awal
       gameState.players = [];
+      playerTokens.clear();
       gameState.roundNumber = 1;
       gameState.teamsLocked = false;
       gameState.accumulatedScores = {};
@@ -1603,6 +1793,7 @@ function handleAction(action, payload, clientMeta) {
       for (const [ws, meta] of wsClients.entries()) {
         if (meta.role !== "game_master") {
           meta.playerId = null;
+          meta.playerToken = null;
           meta.role = null;
           sendWsMessage(ws, {
             type: "PLAYER_KICKED",
@@ -1650,15 +1841,32 @@ const server = http.createServer((req, res) => {
 
   // Endpoint API State (GET)
   if (pathname === "/api/state" && req.method === "GET") {
+    const clientIp = getClientIp(req);
     const requestedRole = parsedUrl.searchParams.get("role") || "player";
+    const hasGmPinParam =
+      req.headers["x-gm-pin"] !== undefined || parsedUrl.searchParams.has("pin");
     const gmPin = String(
       req.headers["x-gm-pin"] || parsedUrl.searchParams.get("pin") || ""
     ).trim();
-    const verifiedRole =
-      requestedRole === "game_master" && gmPin === GM_DEFAULT_PIN
-        ? "game_master"
-        : "player";
+
+    let verifiedRole = "player";
+    if (requestedRole === "game_master" && (hasGmPinParam || gmPin)) {
+      const pinCheck = verifyGmPinWithRateLimit(clientIp, gmPin);
+      if (pinCheck.locked) {
+        res.writeHead(429, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ ok: false, error: pinCheck.error }));
+        return;
+      }
+      if (pinCheck.ok) {
+        verifiedRole = "game_master";
+      }
+    }
+
     const playerId = parsedUrl.searchParams.get("playerId") || null;
+    const playerToken = String(
+      req.headers["x-player-token"] || parsedUrl.searchParams.get("playerToken") || ""
+    ).trim();
+    const tokenVerified = verifyPlayerIdentity(playerId, playerToken);
     const deviceId = parsedUrl.searchParams.get("deviceId") || cookieDeviceId;
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
     res.end(
@@ -1666,7 +1874,7 @@ const server = http.createServer((req, res) => {
         ok: true,
         deviceId,
         gmVerified: verifiedRole === "game_master",
-        state: buildClientState(verifiedRole, playerId, deviceId)
+        state: buildClientState(verifiedRole, playerId, deviceId, { tokenVerified })
       })
     );
     return;
@@ -1681,40 +1889,58 @@ const server = http.createServer((req, res) => {
     });
     req.on("end", () => {
       try {
+        const clientIp = getClientIp(req);
         const data = JSON.parse(body || "{}");
         const deviceId =
           (data.payload && data.payload.deviceId) || data.deviceId || cookieDeviceId;
         const gmPin = String(
           req.headers["x-gm-pin"] ||
             data.gmPin ||
-            (data.payload && data.payload.gmPin) ||
+            (data.payload && (data.payload.gmPin || data.payload.pin)) ||
             ""
         ).trim();
-        const verifiedRole =
-          data.role === "game_master" && gmPin === GM_DEFAULT_PIN
+        const reqPlayerToken = String(
+          req.headers["x-player-token"] ||
+            data.playerToken ||
+            (data.payload && data.payload.playerToken) ||
+            ""
+        ).trim();
+        const payloadWithDevice = {
+          ...(data.payload || {}),
+          deviceId,
+          playerToken:
+            data.payload && data.payload.playerToken !== undefined
+              ? data.payload.playerToken
+              : reqPlayerToken
+        };
+        const clientMeta = {
+          deviceId,
+          ip: clientIp,
+          role: "player",
+          gmPin,
+          reqPlayerToken
+        };
+        const result = handleAction(data.action, payloadWithDevice, clientMeta);
+        const httpStatus = result && result.statusCode === 429 ? 429 : 200;
+        const finalRole =
+          (result && result.ok && result.role === "game_master") ||
+          clientMeta.role === "game_master"
             ? "game_master"
             : "player";
-        const payloadWithDevice = { ...(data.payload || {}), deviceId };
-        const result = handleAction(data.action, payloadWithDevice, {
-          deviceId,
-          role: verifiedRole,
-          gmPin
-        });
-        const finalRole =
-          result && result.ok && result.role === "game_master"
-            ? "game_master"
-            : verifiedRole;
         const finalPlayerId =
           (result.player && result.player.id) || data.playerId || null;
-        // Response POST /api/action selalu memakai omitStrokes: true agar hemat payload;
-        // strokes lengkap dikirim melalui WebSocket saat transisi fase yang memerlukannya
-        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        const tokenVerified =
+          Boolean(result && result.ok && result.playerToken) ||
+          verifyPlayerIdentity(finalPlayerId, reqPlayerToken);
+        // Response POST /api/action selalu memakai omitStrokes: true agar hemat payload
+        res.writeHead(httpStatus, { "Content-Type": "application/json; charset=utf-8" });
         res.end(
           JSON.stringify({
             ...result,
             deviceId,
             state: buildClientState(finalRole, finalPlayerId, deviceId, {
-              omitStrokes: true
+              omitStrokes: true,
+              tokenVerified
             })
           })
         );
@@ -1783,8 +2009,11 @@ server.on("upgrade", (req, socket) => {
   const cookies = parseCookies(req);
   const clientMeta = {
     clientId: crypto.randomUUID(),
+    ip: getClientIp(req),
     role: "player",
+    wsAuthenticatedGM: false,
     playerId: null,
+    playerToken: null,
     deviceId: cookies["tinta_device_id"] || null
   };
   wsClients.set(socket, clientMeta);
@@ -1853,43 +2082,114 @@ server.on("upgrade", (req, socket) => {
             if (msg.deviceId) {
               clientMeta.deviceId = msg.deviceId;
             }
-            if (msg.role === "game_master" && msg.pin === GM_DEFAULT_PIN) {
-              clientMeta.role = "game_master";
-            }
-            if (msg.playerId) {
-              clientMeta.playerId = msg.playerId;
-              const p = gameState.players.find((pl) => pl.id === msg.playerId);
-              if (p) p.connected = true;
-            } else if (clientMeta.deviceId && clientMeta.role !== "game_master") {
-              const bound = gameState.players.find(
-                (pl) => !pl.isBot && pl.deviceId === clientMeta.deviceId
-              );
-              if (bound) {
-                clientMeta.playerId = bound.id;
-                bound.connected = true;
+            if (msg.role === "game_master") {
+              const pinCheck = verifyGmPinWithRateLimit(clientMeta.ip, msg.pin);
+              if (!pinCheck.ok) {
+                clientMeta.role = "player";
+                clientMeta.wsAuthenticatedGM = false;
+                sendWsMessage(socket, {
+                  type: "ACTION_RESULT",
+                  requestId: msg.requestId !== undefined ? msg.requestId : null,
+                  action: "IDENTIFY",
+                  ok: false,
+                  statusCode: pinCheck.statusCode,
+                  error: pinCheck.error,
+                  result: {
+                    ok: false,
+                    statusCode: pinCheck.statusCode,
+                    error: pinCheck.error
+                  }
+                });
+                continue;
               }
+              clientMeta.role = "game_master";
+              clientMeta.wsAuthenticatedGM = true;
+              sendWsMessage(socket, {
+                type: "STATE_UPDATE",
+                state: buildClientState(
+                  clientMeta.role,
+                  clientMeta.playerId,
+                  clientMeta.deviceId
+                )
+              });
+              continue;
             }
+
+            // IDENTIFY role player wajib menyertakan playerId dan playerToken yang cocok
+            const candidatePlayerId =
+              msg.playerId || (msg.payload && msg.payload.playerId) || null;
+            const candidateToken =
+              msg.playerToken || (msg.payload && msg.payload.playerToken) || "";
+            if (!verifyPlayerIdentity(candidatePlayerId, candidateToken)) {
+              clientMeta.playerId = null;
+              clientMeta.playerToken = null;
+              sendWsMessage(socket, {
+                type: "ACTION_RESULT",
+                requestId: msg.requestId !== undefined ? msg.requestId : null,
+                action: "IDENTIFY",
+                ok: false,
+                error: "Identitas pemain tidak valid.",
+                result: {
+                  ok: false,
+                  error: "Identitas pemain tidak valid."
+                }
+              });
+              continue;
+            }
+
+            clientMeta.role = "player";
+            clientMeta.playerId = candidatePlayerId;
+            clientMeta.playerToken = candidateToken;
+            const p = gameState.players.find((pl) => pl.id === candidatePlayerId);
+            if (p) p.connected = true;
+
             sendWsMessage(socket, {
               type: "STATE_UPDATE",
               state: buildClientState(
                 clientMeta.role,
                 clientMeta.playerId,
-                clientMeta.deviceId
+                clientMeta.deviceId,
+                { tokenVerified: true }
               )
             });
           } else if (msg.type === "ACTION") {
-            const actionPayload = msg.payload || {};
+            const actionPayload = { ...(msg.payload || {}) };
+            if (actionPayload.playerToken === undefined && msg.playerToken !== undefined) {
+              actionPayload.playerToken = msg.playerToken;
+            }
+            if (
+              actionPayload.gmPin === undefined &&
+              (msg.gmPin !== undefined || msg.pin !== undefined)
+            ) {
+              actionPayload.gmPin = msg.gmPin !== undefined ? msg.gmPin : msg.pin;
+            }
             const reflectedRequestId =
               msg.requestId !== undefined
                 ? msg.requestId
                 : actionPayload.requestId !== undefined
                 ? actionPayload.requestId
                 : null;
-            const res = handleAction(msg.action, actionPayload, clientMeta);
+            const res = handleAction(msg.action, actionPayload, {
+              ...clientMeta,
+              reqPlayerToken: actionPayload.playerToken || "",
+              gmPin: actionPayload.gmPin || ""
+            });
+            if (res && res.ok && res.role === "game_master") {
+              clientMeta.role = "game_master";
+              clientMeta.wsAuthenticatedGM = true;
+            }
+            if (res && res.ok && res.player && res.playerToken) {
+              clientMeta.role = "player";
+              clientMeta.playerId = res.player.id;
+              clientMeta.playerToken = res.playerToken;
+            }
             sendWsMessage(socket, {
               type: "ACTION_RESULT",
               requestId: reflectedRequestId,
               action: msg.action,
+              ok: res.ok,
+              error: res.error,
+              statusCode: res.statusCode,
               result: res
             });
           }
@@ -1931,6 +2231,10 @@ if (require.main === module) {
 module.exports = {
   handleAction,
   buildClientState,
+  verifyGmPinWithRateLimit,
+  verifyPlayerIdentity,
+  gmPinAttemptsByIp,
+  playerTokens,
   gameState,
   server
 };

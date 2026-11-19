@@ -17,17 +17,19 @@ Aplikasi menggunakan pola *hybrid*:
 - **Klien $\rightarrow$ Server untuk Goresan Kanvas (`DRAW_STROKE`):** dikirim via **WebSocket** (`type: "ACTION"`) agar bebas latensi, dengan fallback ke `POST /api/action` bila WebSocket sedang tidak `OPEN`.
 - **Klien $\rightarrow$ Server untuk Semua Action Lainnya:** dikirim via **`POST /api/action`** agar klien mendapat *response callback* langsung sekaligus memicu `broadcastState()` ke seluruh klien WebSocket.
 
-#### A. `GET /api/state` (`server.js` baris `1618–1638`)
+#### A. `GET /api/state` (`server.js` baris `1842–1887`)
 Mengambil *snapshot* state permainan saat ini (digunakan saat inisialisasi halaman).
 - **Method:** `GET`
 - **Query Parameters:**
   - `role` *(opsional)*: `"player"` (default) atau `"game_master"`.
   - `playerId` *(opsional)*: UUID pemain jika sudah bergabung.
+  - `playerToken` *(opsional)*: Token rahasia pemain (alternatif dari header `X-Player-Token`).
   - `deviceId` *(opsional)*: ID unik perangkat (`dev-...`).
   - `pin` *(opsional)*: PIN Game Master (alternatif dari header `X-GM-Pin`).
 - **Headers:**
   - `Cookie`: `tinta_device_id=<deviceId>` (diset otomatis oleh server/klien).
-  - `X-GM-Pin` *(wajib bila `role=game_master`)*: `"PIN_DIKIRIM"`. Jika tidak cocok dengan `GM_DEFAULT_PIN`, server otomatis menurunkan `verifiedRole` menjadi `"player"`.
+  - `X-Player-Token` *(opsional, dikirim oleh klien bila memiliki `playerToken`)*: UUID `playerToken` untuk memverifikasi identitas `playerId`.
+  - `X-GM-Pin` *(wajib bila `role=game_master`)*: `"PIN_DIKIRIM"`. Diverifikasi melalui rate limiter `verifyGmPinWithRateLimit(clientIp, candidatePin)`. Jika salah $\ge 5$ kali dalam 10 menit dari IP yang sama (`X-Forwarded-For` / `remoteAddress`), server mengembalikan **HTTP `429 Too Many Requests`** dengan `{ "ok": false, "error": "Terlalu banyak percobaan PIN. Coba lagi dalam X menit." }`.
 - **Response Body (`200 OK`, `application/json; charset=utf-8`):**
   ```json
   {
@@ -38,32 +40,35 @@ Mengambil *snapshot* state permainan saat ini (digunakan saat inisialisasi halam
   }
   ```
 
-#### B. `POST /api/action` (`server.js` baris `1641–1694`)
+#### B. `POST /api/action` (`server.js` baris `1890–1949`)
 Menjalankan sebuah aksi pemain atau Game Master.
 - **Method:** `POST`
 - **Headers:**
   - `Content-Type: application/json`
+  - `X-Player-Token: <playerToken>` *(dikirim oleh klien jika memiliki `playerToken`)*
   - `X-GM-Pin: PIN_DIKIRIM` *(dikirim oleh klien jika `client.role === "game_master"`)*
 - **Request Body:**
   ```json
   {
     "action": "NAMA_ACTION",
     "payload": {
-      "deviceId": "dev-9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
+      "deviceId": "dev-9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+      "playerToken": "a8f5f167-f44f-4964-8e69-9b8f38b12345"
     },
     "role": "player",
     "playerId": "3f9a1c02-7a8e-4e1a-9b24-112233445566",
+    "playerToken": "a8f5f167-f44f-4964-8e69-9b8f38b12345",
     "deviceId": "dev-9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
     "gmPin": ""
   }
   ```
-- **Response Body (`200 OK`):**
-  Menggabungkan objek hasil `handleAction(...)` dengan `deviceId` dan `state` terbaru:
+- **Response Body (`200 OK` atau `429 Too Many Requests` saat IP terkunci karena salah PIN GM 5 kali):**
+  Menggabungkan objek hasil `handleAction(...)` dengan `deviceId` dan `state` terbaru (`omitStrokes: true`):
   ```json
   {
     "ok": true,
     "deviceId": "dev-9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
-    "state": { "...objek buildClientState..." }
+    "state": { "...objek buildClientState (strokesOmitted: true)..." }
   }
   ```
 
@@ -71,16 +76,22 @@ Menjalankan sebuah aksi pemain atau Game Master.
 - **Hanya ada 1 room global** di dalam memori proses Node.js (`const gameState = { ... }` di `server.js` baris `55–76`).
 - Seluruh koneksi HTTP dan WebSocket pada satu instance server berinteraksi dengan objek `gameState` yang sama. Tidak ada konsep `roomId` atau multi-room.
 
-### 1.4 Peran Cookie `tinta_device_id` vs `deviceId` di Dalam Pesan
-Sistem menerapkan aturan **1 Perangkat = 1 Pemain** menggunakan `deviceId`:
-1. **Di Klien (`public/app.js` baris `12–27`):** Fungsi `getOrCreateDeviceId()` membaca cookie `tinta_device_id` dan `localStorage["tinta_estafet_device_id"]`. Jika belum ada, klien membuat string `dev-<UUID>`, lalu menyimpannya di kedua tempat (`localStorage` dan `document.cookie` dengan `max-age=86400; SameSite=Lax`).
-2. **Di Server (`server.js` baris `1607–1615` & `1750–1756`):**
-   - Pada setiap request HTTP, jika cookie `tinta_device_id` belum ada, server membuat `dev-<UUID>` dan mengirim header `Set-Cookie: tinta_device_id=...; Path=/; Max-Age=86400; SameSite=Lax`.
-   - Saat koneksi WebSocket dibuka (`upgrade`), server mengisi `clientMeta.deviceId` awal dari cookie `tinta_device_id`.
-3. **Prioritas Resolusi:**
-   - Pada `POST /api/action` (`server.js` baris `1651–1653`), server mengutamakan `data.payload.deviceId`, lalu `data.deviceId`, dan terakhir fallback ke `cookieDeviceId`.
-   - Pada WebSocket `IDENTIFY` (`server.js` baris `1818–1820`), `msg.deviceId` di dalam pesan JSON akan menimpa `clientMeta.deviceId` yang berasal dari cookie.
-   - Dalam `buildClientState` (`server.js` baris `809–812`), jika `playerId` tidak ditemukan, server mencari pemain non-Bot yang memiliki `p.deviceId === deviceId` dan mengembalikannya pada field `boundPlayer`, sehingga tab/window baru di perangkat yang sama otomatis terikat ke pemain yang sama.
+### 1.4 Peran Cookie `tinta_device_id`, `deviceId`, dan Token Rahasia `playerToken`
+Sistem menerapkan aturan **1 Perangkat = 1 Pemain** menggunakan `deviceId` dan mengikat identitas tiap pemain dengan token rahasia **`playerToken`**:
+1. **Di Klien (`public/app.js` baris `3–36`):**
+   - Fungsi `getOrCreateDeviceId()` membaca cookie `tinta_device_id` dan `localStorage["tinta_estafet_device_id"]`. Jika belum ada, klien membuat string `dev-<UUID>`, lalu menyimpannya di kedua tempat (`localStorage` dan `document.cookie` dengan `max-age=86400; SameSite=Lax`).
+   - Saat `JOIN_PLAYER` berhasil, server mengembalikan `playerToken` (`crypto.randomUUID()`) yang disimpan klien di `localStorage["tinta_estafet_player_token"]` (`client.playerToken`).
+2. **Di Server (`server.js` baris `79–82` & `1253–1277`):**
+   - Server menyimpan peta `playerTokens` (`Map<playerId, playerToken>`) di memori yang hanya diketahui oleh server dan pemain pemiliknya.
+   - `JOIN_PLAYER` ulang dari `deviceId` yang sama (reconnect) mengembalikan `playerId` dan `playerToken` yang **sama**.
+   - Untuk mencegah penyamaran identitas (*impersonation*), **`deviceId` pemain lain tidak pernah disertakan** di `state.players` maupun daftar anggota grup (`group.members`). Properti `deviceId` hanya muncul pada objek `state.boundPlayer` milik perangkat penampil itu sendiri.
+3. **Kewajiban `playerToken`:**
+   - Server mewajibkan `playerToken` yang cocok dengan `playerId` (`verifyPlayerIdentity(playerId, playerToken)`) pada 4 pesan/aksi berikut:
+     1. **`PASS_TURN`** (HTTP / WS)
+     2. **`SUBMIT_GUESS`** (HTTP / WS)
+     3. **`DRAW_STROKE`** (WS dan HTTP)
+     4. **`IDENTIFY`** dengan `role: "player"` (WS)
+   - `playerToken` dapat dikirim di `payload.playerToken`, level atas body JSON (`playerToken`), atau header HTTP `X-Player-Token`. Jika tidak cocok atau kosong, server menolak aksi dengan `{ "ok": false, "error": "Identitas pemain tidak valid." }`.
 
 ---
 
@@ -95,24 +106,26 @@ Klien berkomunikasi melalui **2 kanal**:
 ---
 
 ### 2.1 Pesan WebSocket `IDENTIFY`
-Dikirim otomatis oleh klien tepat saat koneksi WebSocket `open` (`public/app.js` baris `96–106`), setelah pemain berhasil `JOIN_PLAYER` (`baris 531–539`), dan setelah login GM berhasil (`baris 2116–2125`).
+Dikirim otomatis oleh klien saat koneksi WebSocket `open` apabila sesi sudah memiliki kredensial (`(client.role === "game_master" && client.gmPin)` atau `(client.playerId && client.playerToken)`), tepat setelah pemain berhasil `JOIN_PLAYER`, dan setelah login GM berhasil.
 
 #### A. `IDENTIFY` untuk Pemain Biasa
-- **Field Wajib:** `type` (`"IDENTIFY"`).
-- **Field Opsional:** `role` (`"player"`), `playerId` (UUID pemain atau `null` jika belum join), `deviceId` (string), `pin` (`""`).
+- **Field Wajib:** `type` (`"IDENTIFY"`), `role` (`"player"`), `playerId` (UUID pemain), `playerToken` (UUID token rahasia dari `JOIN_PLAYER`).
+- **Field Opsional:** `deviceId` (string), `requestId` (string).
+- **Validasi Server:** Jika `playerToken` tidak cocok dengan `playerId`, server membalas pesan `ACTION_RESULT` dengan `{ "type": "ACTION_RESULT", "requestId": null, "action": "IDENTIFY", "ok": false, "error": "Identitas pemain tidak valid.", "result": { "ok": false, "error": "Identitas pemain tidak valid." } }`.
 ```json
 {
   "type": "IDENTIFY",
   "role": "player",
   "playerId": "3f9a1c02-7a8e-4e1a-9b24-112233445566",
-  "deviceId": "dev-9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
-  "pin": ""
+  "playerToken": "a8f5f167-f44f-4964-8e69-9b8f38b12345",
+  "deviceId": "dev-9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
 }
 ```
 
 #### B. `IDENTIFY` untuk Game Master
-- **Field Wajib:** `type` (`"IDENTIFY"`), `role` (`"game_master"`), `pin` (`"PIN_DIKIRIM"`, wajib cocok dengan `GM_DEFAULT_PIN` agar socket ditandai sebagai `game_master`).
-- **Field Opsional:** `deviceId`.
+- **Field Wajib:** `type` (`"IDENTIFY"`), `role` (`"game_master"`), `pin` (`"PIN_DIKIRIM"`, wajib cocok dengan `GM_DEFAULT_PIN` dan melewati pemeriksaan rate limit IP `verifyGmPinWithRateLimit`).
+- **Field Opsional:** `deviceId`, `requestId`.
+- **Validasi Server:** Jika PIN salah atau IP sedang terkunci (5 kali salah dalam 10 menit), server menurunkan socket menjadi `"player"` dan mengirim pesan `ACTION_RESULT` dengan `ok: false` beserta pesan error (dan `statusCode: 429` bila terkunci).
 ```json
 {
   "type": "IDENTIFY",
@@ -127,9 +140,10 @@ Dikirim otomatis oleh klien tepat saat koneksi WebSocket `open` (`public/app.js`
 ### 2.2 Aksi Pemain Biasa & Autentikasi
 
 #### 1. `JOIN_PLAYER`
-Dikirim via `POST /api/action` saat pemain menekan tombol *"Masuk & Gabung Grup Otomatis"* di halaman masuk (`ENTRY`). Dapat dikirim di fase mana saja selama jumlah pemain `< maxPlayers`.
+Dikirim via `POST /api/action` saat pemain menekan tombol *"Masuk & Gabung Grup Otomatis"* di halaman masuk (`ENTRY`). Dapat dikirim di fase mana saja selama jumlah pemain `< maxPlayers` (atau saat reconnect dari `deviceId` yang sama).
 - **Field `payload` Wajib:** `name` (string, di-*trim* & dipotong maks 24 karakter; wajib jika perangkat belum terdaftar).
-- **Field `payload` Opsional:** `playerId` (UUID sesi sebelumnya), `deviceId` (string).
+- **Field `payload` Opsional:** `playerId` (UUID sesi sebelumnya), `deviceId` (string), `playerToken` (UUID token sebelumnya jika ada).
+- **Contoh Request JSON (`POST /api/action`):**
 ```json
 {
   "action": "JOIN_PLAYER",
@@ -144,11 +158,62 @@ Dikirim via `POST /api/action` saat pemain menekan tombol *"Masuk & Gabung Grup 
   "gmPin": ""
 }
 ```
+- **Contoh Response JSON `JOIN_PLAYER` (mengembalikan `playerToken` rahasia hanya kepada pemain tersebut):**
+```json
+{
+  "ok": true,
+  "playerToken": "a8f5f167-f44f-4964-8e69-9b8f38b12345",
+  "player": {
+    "id": "3f9a1c02-7a8e-4e1a-9b24-112233445566",
+    "name": "Budi",
+    "deviceId": "dev-9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+    "groupId": 1,
+    "turnOrder": 1,
+    "isBot": false,
+    "connected": true
+  },
+  "deviceId": "dev-9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+  "state": {
+    "phase": "LOBBY",
+    "roundNumber": 1,
+    "teamsLocked": false,
+    "strokesOmitted": true,
+    "maxPlayers": 40,
+    "players": [
+      {
+        "id": "3f9a1c02-7a8e-4e1a-9b24-112233445566",
+        "name": "Budi",
+        "groupId": 1,
+        "turnOrder": 1,
+        "isBot": false,
+        "connected": true
+      }
+    ],
+    "groups": [],
+    "boundPlayer": {
+      "id": "3f9a1c02-7a8e-4e1a-9b24-112233445566",
+      "name": "Budi",
+      "deviceId": "dev-9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+      "groupId": 1,
+      "turnOrder": 1,
+      "isBot": false,
+      "connected": true
+    },
+    "activeGuessGroupIndex": 0,
+    "clueActive": false,
+    "clueRevealedCount": 1,
+    "guessFeed": [],
+    "customWordsCount": 78,
+    "serverTime": 1795059568000
+  }
+}
+```
 
 #### 2. `AUTH_GM`
-Dikirim via `POST /api/action` saat pengguna memasukkan PIN di modal Akses Game Master. Dapat dilakukan di fase mana saja (jika dilakukan saat `LOBBY` dan perangkat tersebut sebelumnya sudah masuk sebagai pemain, data pemainnya otomatis dihapus dari daftar grup agar tidak menjadi pemain kosong).
+Dikirim via `POST /api/action` saat pengguna memasukkan PIN di modal Akses Game Master. Dapat dilakukan di fase mana saja (jika dilakukan saat `LOBBY` dan perangkat tersebut sebelumnya sudah masuk sebagai pemain, data pemainnya beserta `playerToken`-nya otomatis dihapus dari daftar grup agar tidak menjadi pemain kosong).
 - **Field `payload` Wajib:** `pin` (`"PIN_DIKIRIM"`).
 - **Field `payload` Opsional:** `playerId`, `deviceId`.
+- **Rate Limit PIN:** Maksimal 5 percobaan PIN salah per IP dalam 10 menit; percobaan ke-5 yang salah langsung mengunci IP tersebut selama 10 menit dengan HTTP `429` dan `{ "ok": false, "error": "Terlalu banyak percobaan PIN. Coba lagi dalam 10 menit." }`. PIN benar me-reset hitungan gagal untuk IP tersebut.
 ```json
 {
   "action": "AUTH_GM",
@@ -165,9 +230,11 @@ Dikirim via `POST /api/action` saat pengguna memasukkan PIN di modal Akses Game 
 ```
 
 #### 3. `DRAW_STROKE` (Streaming Goresan Menggambar)
-- **Syarat Fase:** `gameState.phase === "DRAWING"`, `group.status === "DRAWING"`, dan `playerId` harus sama dengan pemain yang sedang mendapat giliran aktif (`members[group.currentTurnIndex].id`).
-- **Kapan & Seberapa Sering Dikirim (`public/app.js` baris `1466–1486`):**
-  Dikirim secara *real-time* pada event `mousemove` / `touchmove` selama pointer ditekan (`isDrawingPointerDown === true`) setiap kali jarak Euclidean (`Math.hypot(pt.x - lastPoint.x, pt.y - lastPoint.y)`) بين titik baru dan titik terakhir **$\ge 2$ piksel** pada sistem koordinat kanvas `800 x 500`. Server menolak segmen dengan jarak `< 0.2` piksel.
+- **Syarat Fase & Identitas:**
+  - Wajib menyertakan `playerToken` yang cocok dengan `playerId` (baik via WebSocket maupun HTTP fallback). Jika tidak cocok, server mengembalikan `{ "ok": false, "error": "Identitas pemain tidak valid." }`.
+  - `gameState.phase === "DRAWING"`, `group.status === "DRAWING"`, dan `playerId` harus sama dengan pemain yang sedang mendapat giliran aktif (`members[group.currentTurnIndex].id`).
+- **Kapan & Seberapa Sering Dikirim (`public/app.js` baris `1541–1561`):**
+  Dikirim secara *real-time* pada event `mousemove` / `touchmove` selama pointer ditekan (`isDrawingPointerDown === true`) setiap kali jarak Euclidean (`Math.hypot(pt.x - lastPoint.x, pt.y - lastPoint.y)`) antara titik baru dan titik terakhir **$\ge 2$ piksel** pada sistem koordinat kanvas `800 x 500`. Server menolak segmen dengan jarak `< 0.2` piksel.
 - **Format Titik, Warna, dan Ukuran:**
   - `x1, y1, x2, y2`: angka koordinat pada kanvas `800x500` (di-*clamp* `0..800` untuk `x` dan `0..500` untuk `y`, dibulatkan 1 angka desimal di server).
   - `color`: string hex warna dari daftar `DRAWING_TOOLS.colors` (`"#000000"`, `"#EF4444"`, `"#3B82F6"`, `"#10B981"`, `"#F59E0B"`, `"#8B5CF6"`, `"#EC4899"`, `"#92400E"`), atau `"#FFFFFF"` jika penghapus aktif.
@@ -179,9 +246,11 @@ Dikirim via `POST /api/action` saat pengguna memasukkan PIN di modal Akses Game 
   "type": "ACTION",
   "requestId": "stroke-1",
   "action": "DRAW_STROKE",
+  "playerToken": "a8f5f167-f44f-4964-8e69-9b8f38b12345",
   "payload": {
     "groupId": 1,
     "playerId": "3f9a1c02-7a8e-4e1a-9b24-112233445566",
+    "playerToken": "a8f5f167-f44f-4964-8e69-9b8f38b12345",
     "segment": {
       "x1": 240.5,
       "y1": 180.0,
@@ -197,18 +266,23 @@ Dikirim via `POST /api/action` saat pengguna memasukkan PIN di modal Akses Game 
 
 #### 4. `PASS_TURN`
 Dikirim via `POST /api/action` saat pemain yang sedang mendapat giliran aktif menekan tombol *"⏭️ Pass / Selesai Giliran"*.
-- **Syarat Fase:** `DRAWING` (dan `group.status !== "FINISHED"`, serta `payload.playerId` wajib cocok dengan pemain aktif di grup tersebut).
-- **Field `payload` Wajib:** `groupId` (number), `playerId` (string).
+- **Syarat Fase & Identitas:**
+  - Wajib menyertakan `playerToken` yang cocok dengan `playerId` (di `payload.playerToken`, body `playerToken`, atau header `X-Player-Token`). Jika tidak cocok: `{ "ok": false, "error": "Identitas pemain tidak valid." }`.
+  - Wajib berada di fase `DRAWING` (`gameState.phase === "DRAWING"`). Jika dikirim di luar fase `DRAWING`, server mengembalikan `{ "ok": false, "error": "Pass giliran hanya dapat dilakukan pada fase menggambar." }`.
+  - Grup belum selesai (`group.status !== "FINISHED"`) dan `payload.playerId` wajib cocok dengan pemain yang sedang mendapat giliran aktif di grup tersebut (`activePlayer.id === payload.playerId`).
+- **Field `payload` Wajib:** `groupId` (number), `playerId` (string), `playerToken` (string).
 ```json
 {
   "action": "PASS_TURN",
   "payload": {
     "groupId": 1,
     "playerId": "3f9a1c02-7a8e-4e1a-9b24-112233445566",
+    "playerToken": "a8f5f167-f44f-4964-8e69-9b8f38b12345",
     "deviceId": "dev-9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
   },
   "role": "player",
   "playerId": "3f9a1c02-7a8e-4e1a-9b24-112233445566",
+  "playerToken": "a8f5f167-f44f-4964-8e69-9b8f38b12345",
   "deviceId": "dev-9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
   "gmPin": ""
 }
@@ -216,18 +290,22 @@ Dikirim via `POST /api/action` saat pemain yang sedang mendapat giliran aktif me
 
 #### 5. `SUBMIT_GUESS`
 Dikirim via `POST /api/action` saat pemain dari grup penebak mengirim form tebakan.
-- **Syarat Fase:** `gameState.phase === "GUESSING"`, pemain bukan anggota dari grup yang gambarnya sedang ditebak (`player.groupId !== targetGroup.id`), dan pemain tersebut belum pernah menebak benar untuk gambar grup ini.
-- **Field `payload` Wajib:** `playerId` (string), `text` (string, di-*trim* dan dipotong maks 60 karakter).
+- **Syarat Fase & Identitas:**
+  - Wajib menyertakan `playerToken` yang cocok dengan `playerId` (di `payload.playerToken`, body `playerToken`, atau header `X-Player-Token`). Jika tidak cocok: `{ "ok": false, "error": "Identitas pemain tidak valid." }`.
+  - `gameState.phase === "GUESSING"`, pemain bukan anggota dari grup yang gambarnya sedang ditebak (`player.groupId !== targetGroup.id`), dan pemain tersebut belum pernah menebak benar untuk gambar grup ini.
+- **Field `payload` Wajib:** `playerId` (string), `playerToken` (string), `text` (string, di-*trim* dan dipotong maks 60 karakter).
 ```json
 {
   "action": "SUBMIT_GUESS",
   "payload": {
     "playerId": "3f9a1c02-7a8e-4e1a-9b24-112233445566",
+    "playerToken": "a8f5f167-f44f-4964-8e69-9b8f38b12345",
     "text": "Kucing",
     "deviceId": "dev-9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
   },
   "role": "player",
   "playerId": "3f9a1c02-7a8e-4e1a-9b24-112233445566",
+  "playerToken": "a8f5f167-f44f-4964-8e69-9b8f38b12345",
   "deviceId": "dev-9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
   "gmPin": ""
 }
@@ -616,7 +694,6 @@ Tombol *"🗑️ Reset Semua"* di halaman `LOBBY`: mengeluarkan (kick) semua pem
       {
         "id": "3f9a1c02-7a8e-4e1a-9b24-112233445566",
         "name": "Budi",
-        "deviceId": "dev-9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
         "groupId": 1,
         "turnOrder": 1,
         "isBot": false,
@@ -942,85 +1019,109 @@ Dikirim via WebSocket ke klien yang dikeluarkan lewat `KICK_PLAYER` atau `KICK_A
   ```
 - Namun jika perangkat tersebut **sudah** terdaftar sebelumnya di `gameState.players` (berdasarkan `deviceId` atau `playerId`), server **tetap mengizinkan masuk kembali (reconnect)** ke akun pemainnya meskipun jumlah pemain saat itu sudah mencapai `maxPlayers`.
 
-### 5.2 Rate Limit, Validasi Ukuran Payload, dan Batas Percobaan PIN
-- **Rate Limit:** **Tidak ada** *rate limiter* per IP atau per socket untuk `SUBMIT_GUESS`, `DRAW_STROKE`, maupun request HTTP.
+### 5.2 Rate Limit, Validasi Ukuran Payload, Batas Percobaan PIN GM, dan Keamanan Identitas
+- **Batas Percobaan PIN Game Master (`verifyGmPinWithRateLimit` di `server.js` baris `100–159`):**
+  - Berlaku di **semua jalur PIN**: aksi `AUTH_GM`, pesan WebSocket `IDENTIFY` dengan `role: "game_master"`, header `X-GM-Pin` / field `gmPin` pada seluruh aksi `GM_ONLY_ACTIONS`, dan `GET /api/state?role=game_master`.
+  - **Ekstraksi IP (`getClientIp`):** Membaca IP pertama dari header `X-Forwarded-For` (karena berjalan di belakang proxy Railway), dengan fallback ke `req.socket.remoteAddress`.
+  - **Aturan Lockout:** Maksimal **5 PIN salah per IP dalam jendela 10 menit** (`600.000 ms`). Pada kegagalan ke-5 (dan selama masa kunci 10 menit berikutnya), server mengembalikan **HTTP `429 Too Many Requests`** (atau `statusCode: 429` pada pesan WS) dengan body:
+    ```json
+    {
+      "ok": false,
+      "statusCode": 429,
+      "error": "Terlalu banyak percobaan PIN. Coba lagi dalam 10 menit."
+    }
+    ```
+  - **Reset & Isolasi:** Memasukkan PIN yang benar akan langsung me-reset hitungan gagal (`gmPinAttemptsByIp.delete(ip)`). Penguncian IP **hanya** memengaruhi pemeriksaan PIN Game Master dan **tidak** menghalangi aksi pemain biasa (`JOIN_PLAYER`, `DRAW_STROKE`, `PASS_TURN`, `SUBMIT_GUESS`) meskipun banyak pemain berada di satu jaringan Wi-Fi / IP yang sama.
+- **Pengikatan Identitas Pemain dengan `playerToken` (`verifyPlayerIdentity` di `server.js` baris `162–169`):**
+  - Saat `JOIN_PLAYER` berhasil, server membuat `playerToken = crypto.randomUUID()` di `playerTokens` (`Map<playerId, playerToken>`) dan hanya mengirimkannya di response HTTP `JOIN_PLAYER`.
+  - `playerToken` yang cocok dengan `playerId` **wajib** disertakan pada `PASS_TURN`, `SUBMIT_GUESS`, `DRAW_STROKE` (WS dan HTTP), serta `IDENTIFY` role `player`. Jika tidak cocok: `{ "ok": false, "error": "Identitas pemain tidak valid." }`.
+  - `state.players` dan `group.members` tidak menyertakan `deviceId` maupun `playerToken` pemain lain.
+- **Batas Waktu (Timeout 10 Detik) & Coba Ulang di Klien (`public/app.js` baris `173–250`):**
+  - `sendAction` menggunakan `AbortController` dengan batas waktu **10 detik** (`10.000 ms`).
+  - Khusus untuk `JOIN_PLAYER`, jika terjadi timeout (`AbortError`), gangguan jaringan, atau HTTP `>= 500`, klien otomatis mencoba ulang maksimal **2 kali** (total hingga 3 percobaan) sambil menampilkan toast `"Koneksi lambat, mencoba lagi…"`. Karena permintaan menyertakan `deviceId` yang sama, percobaan ulang dijamin idempoten dan tidak membuat pemain ganda.
+  - Untuk aksi lain (`PASS_TURN`, `SUBMIT_GUESS`, dll.), jika gagal atau timeout, klien menampilkan pesan gagal yang jelas, memulihkan teks tebakan / mengaktifkan kembali tombol, dan membiarkan pemain menekan ulang tanpa risiko poin ganda.
 - **Validasi Ukuran Payload & Input:**
-  - **HTTP Body (`POST /api/action`, `server.js` baris `1646`):** Maksimal `1.000.000` karakter (~1 MB). Jika `body.length > 1e6`, koneksi langsung diputus dengan `req.destroy()`.
+  - **HTTP Body (`POST /api/action`, `server.js` baris `1895`):** Maksimal `1.000.000` karakter (~1 MB). Jika `body.length > 1e6`, koneksi langsung diputus dengan `req.destroy()`.
   - **Nama Pemain (`JOIN_PLAYER`):** Di-*trim* dan dipotong maksimal `24` karakter (`.slice(0, 24)`).
   - **Teks Tebakan (`SUBMIT_GUESS`):** Di-*trim* dan dipotong maksimal `60` karakter (`.slice(0, 60)`).
   - **Koordinat Kanvas (`DRAW_STROKE`):** `x1, x2` di-*clamp* ke `0..800`, `y1, y2` di-*clamp* ke `0..500`.
-- **Batas Percobaan PIN Game Master:** **Tidak ada** *rate limit* atau *lockout* pada `AUTH_GM`. Percobaan PIN yang salah langsung mengembalikan `{ "ok": false, "error": "PIN Game Master salah!" }`.
 
 ### 5.3 Apa yang Disimpan di Memori & Kapan Dibersihkan Antar Ronde
-Seluruh state disimpan di RAM pada variabel `gameState` dan `wsClients`:
+Seluruh state disimpan di RAM pada variabel `gameState`, `playerTokens`, `gmPinAttemptsByIp`, dan `wsClients`:
 - **`gameState.guessFeed`:** Dibatasi maksimal `60` item terbaru (`if (gameState.guessFeed.length > 60) gameState.guessFeed.length = 60`). Dikosongkan (`[]`) setiap kali mulai menggambar (`startDrawingPhase`), setiap pindah grup yang ditebak (`startGuessingForGroup`), serta saat `RETURN_TO_LOBBY`, `RESET_GAME`, dan `KICK_ALL_PLAYERS`.
 - **Antar Ronde (`NEXT_ROUND` $\rightarrow$ `START_DRAWING_PHASE`):**
-  - **Yang Dipertahankan:** `gameState.players` (beserta `groupId` dan `turnOrder` masing-masing karena `teamsLocked = true`), `gameState.accumulatedScores` (menyimpan total skor akumulasi tiap grup dari ronde-ronde sebelumnya), `gameState.usedWords` (agar kata yang sudah keluar tidak terpilih lagi sampai kata di pool habis), dan `gameState.settings`.
+  - **Yang Dipertahankan:** `gameState.players` (beserta `groupId`, `turnOrder`, dan `playerTokens` masing-masing karena `teamsLocked = true`), `gameState.accumulatedScores` (menyimpan total skor akumulasi tiap grup dari ronde-ronde sebelumnya), `gameState.usedWords` (agar kata yang sudah keluar tidak terpilih lagi sampai kata di pool habis), dan `gameState.settings`.
   - **Yang Dibersihkan / Di-reset di Ronde Baru (`startDrawingPhase`):** `group.strokes` dikosongkan (`[]`), `group.correctGuessers` dikosongkan (`[]`), `group.remainingInk` dikembalikan penuh ke `initialInk`, `group.carriedOverInk = 0`, `clueActive = false`, `clueRevealedCount = 1`, dan `scoreBreakdown` ronde berjalan di-reset ke `0` (sambil membawa `accumulatedTotal` dari `accumulatedScores`).
 
 ### 5.4 Cara Reconnect (Klien & Server)
 1. **Saat Koneksi WebSocket Terputus:**
-   - Di server (`socket.on("close")`, `server.js` baris `1862–1869`): server mencari pemain dengan `meta.playerId`, mengubah `p.connected = false`, dan menghapus socket dari `wsClients` (data pemain **tidak** dihapus dari grup).
-   - Di klien (`ws.addEventListener("close")`, `public/app.js` baris `133–135`): klien otomatis menjadwalkan `setTimeout(connectWebSocket, 1500)`.
+   - Di server (`socket.on("close")`, `server.js` baris `2206–2213`): server mencari pemain dengan `meta.playerId`, mengubah `p.connected = false`, dan menghapus socket dari `wsClients` (data pemain dan `playerTokens` **tidak** dihapus dari grup).
+   - Di klien (`ws.addEventListener("close")`, `public/app.js` baris `166–168`): klien otomatis menjadwalkan `setTimeout(connectWebSocket, 1500)`.
 2. **Apa yang Dikirim Klien Saat Reconnect / Refresh Halaman:**
-   - Klien membaca `deviceId`, `role`, `playerId`, dan `gmPin` dari `localStorage` (+ cookie `tinta_device_id`).
-   - Saat WebSocket baru terbuka, klien mengirim pesan `IDENTIFY`:
+   - Klien membaca `deviceId`, `role`, `playerId`, `playerToken`, dan `gmPin` dari `localStorage` (+ cookie `tinta_device_id`).
+   - Saat WebSocket baru terbuka, klien mengirim pesan `IDENTIFY` beserta `playerToken`:
      ```json
      {
        "type": "IDENTIFY",
        "role": "player",
        "playerId": "3f9a1c02-7a8e-4e1a-9b24-112233445566",
-       "deviceId": "dev-9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
-       "pin": ""
+       "playerToken": "a8f5f167-f44f-4964-8e69-9b8f38b12345",
+       "deviceId": "dev-9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
      }
      ```
-3. **Apa yang Dibalas Server (`server.js` baris `1817–1844`):**
-   - Server mencocokkan `msg.playerId` (atau mencari pemain non-Bot dengan `pl.deviceId === clientMeta.deviceId` jika `playerId` kosong), menandai `player.connected = true`, mengikat `clientMeta.playerId`, lalu langsung membalas dengan `STATE_UPDATE` penuh (termasuk seluruh `strokes` grup yang berhak dilihat dan objek `boundPlayer`), sehingga klien langsung kembali ke fase dan kanvas yang sedang berjalan tanpa kehilangan progres.
+   - Jika pemain melakukan `JOIN_PLAYER` ulang dari `deviceId` yang sama, server mengembalikan `playerId` dan `playerToken` yang sama.
+3. **Apa yang Dibalas Server (`server.js` baris `2090–2154`):**
+   - Server memverifikasi `verifyPlayerIdentity(msg.playerId, msg.playerToken)`, menandai `player.connected = true`, mengikat `clientMeta.playerId` dan `clientMeta.playerToken`, lalu langsung membalas dengan `STATE_UPDATE` penuh (`omitStrokes: false`, termasuk seluruh `strokes` grup yang berhak dilihat dan objek `boundPlayer`), sehingga klien langsung kembali ke fase dan kanvas yang sedang berjalan tanpa kehilangan progres.
 
 ---
 
 ## 6. FILE PENDUKUNG & NOMOR BARIS HANDLER UTAMA
 
 ### 6.1 `server.js` (Backend HTTP, WebSocket & Game State Machine)
-- **Konfigurasi, Konstanta Tinta & State Global (`gameState`):** baris `8–76`
+- **Konfigurasi, Konstanta Tinta, State Global (`gameState`), `playerTokens`, & `gmPinAttemptsByIp`:** baris `8–89`
+- **Fungsi Keamanan, Rate Limit PIN GM, & Validasi Token Pemain:**
+  - `getClientIp(req)`: baris `91–101`
+  - `verifyGmPinWithRateLimit(ip, candidatePin)`: baris `103–159`
+  - `verifyPlayerIdentity(playerId, candidateToken)`: baris `162–169`
 - **Fungsi Helper & Algoritma:**
-  - `getLocalIPs()` (Cache IP LAN 30 detik): baris `88–105`
-  - `levenshteinDistance(a, b)` (Jarak edit string untuk validasi tebakan): baris `108–128`
-  - `syncGroupsStructure()` & `rebalanceGroups()`: baris `140–207`
-  - `assignNewPlayerToBalancedGroup(player)`: baris `210–230`
+  - `getLocalIPs()` (Cache IP LAN 30 detik): baris `177–194`
+  - `levenshteinDistance(a, b)` (Jarak edit string untuk validasi tebakan): baris `197–217`
+  - `syncGroupsStructure()` & `rebalanceGroups()`: baris `229–296`
+  - `assignNewPlayerToBalancedGroup(player)`: baris `299–319`
 - **Logika Fase Menggambar & Goresan:**
-  - `startGroupMemberTurn(group, turnIndex, withCountdown)`: baris `263–302`
-  - `scheduleBotDrawing(group, botPlayer, turnIndex, delayMs)`: baris `305–351`
-  - `applyStrokeSegment(groupId, playerId, segment)`: baris `354–416`
-  - `handlePassTurn(groupId, playerId, isManualPass)`: baris `419–446`
-  - `startDrawingPhase()`: baris `461–504`
+  - `startGroupMemberTurn(group, turnIndex, withCountdown)`: baris `352–391`
+  - `scheduleBotDrawing(group, botPlayer, turnIndex, delayMs)`: baris `394–440`
+  - `applyStrokeSegment(groupId, playerId, segment)`: baris `443–505`
+  - `handlePassTurn(groupId, playerId, isManualPass)`: baris `508–538`
+  - `startDrawingPhase()`: baris `553–596`
 - **Logika Fase Menebak & Perhitungan Skor:**
-  - `startGuessingForGroup(groupIndex)` & `scheduleBotsGuessing(groupIndex)`: baris `507–566`
-  - `handlePlayerGuess(playerId, rawText)`: baris `569–700`
-  - `recalculateAllScores()`: baris `703–744`
+  - `startGuessingForGroup(groupIndex)` & `scheduleBotsGuessing(groupIndex)`: baris `599–658`
+  - `handlePlayerGuess(playerId, rawText)`: baris `661–792`
+  - `recalculateAllScores()`: baris `795–836`
 - **Game Loop, State Builder & Fungsi Broadcast:**
-  - `startServerGameLoop()` (Loop 200ms transisi giliran + 25s WebSocket Ping): baris `762–804`
-  - `buildClientState(role, playerId, deviceId, options)`: baris `807–954`
-  - `encodeWsFrame(dataStr)` & `sendWsMessage(ws, obj)`: baris `957–988`
-  - `broadcastState(options)`: baris `990–997`
-  - `broadcastStroke(groupId, segment, inkInfo)`: baris `999–1011`
+  - `startServerGameLoop()` (Loop 200ms transisi giliran + 25s WebSocket Ping): baris `854–896`
+  - `buildClientState(role, playerId, deviceId, options)`: baris `899–1081`
+  - `encodeWsFrame(dataStr)` & `sendWsMessage(ws, obj)`: baris `1084–1115`
+  - `broadcastState(options)` & `scheduleCoalescedBroadcast(options)`: baris `1117–1154`
+  - `broadcastStroke(groupId, segment, inkInfo)`: baris `1156–1168`
 - **Dispatcher Aksi Utama:**
-  - `GM_ONLY_ACTIONS` & `handleAction(action, payload, clientMeta)`: baris `1014–1590`
+  - `GM_ONLY_ACTIONS` & `handleAction(action, payload, clientMeta)`: baris `1171–1824`
 - **HTTP Server & WebSocket Frame Parser (`onMessage`):**
-  - `http.createServer` (`GET /api/state`, `POST /api/action`, static files): baris `1604–1727`
-  - `server.on("upgrade", ...)` (WebSocket Handshake): baris `1730–1766`
-  - `socket.on("data", ...)` (Dekoder frame RFC 6455 & handler pesan `IDENTIFY` / `ACTION`): baris `1768–1860`
-  - `socket.on("close", ...)` & `socket.on("error", ...)`: baris `1862–1873`
+  - `http.createServer` (`GET /api/state`, `POST /api/action`, static files): baris `1838–2006`
+  - `server.on("upgrade", ...)` (WebSocket Handshake): baris `2009–2047`
+  - `socket.on("data", ...)` (Dekoder frame RFC 6455 & handler pesan `IDENTIFY` / `ACTION`): baris `2049–2204`
+  - `socket.on("close", ...)` & `socket.on("error", ...)`: baris `2206–2217`
 
 ### 6.2 `public/app.js` (Frontend State, Canvas & WebSocket Client)
-- `getOrCreateDeviceId()` & objek `client`: baris `12–47`
-- `connectWebSocket()` (Handler pesan masuk `PLAYER_KICKED`, `STATE_UPDATE`, `STROKE_STREAM`): baris `90–136`
-- `sendAction(action, payload)` (Pengirim HTTP `POST /api/action`): baris `139–176`
-- `sendStrokeSegmentWS(groupId, segment)` (Pengirim goresan WebSocket): baris `179–195`
-- `handleStateUpdate(newState)` & `computeViewKey(st)`: baris `225–299`
-- `renderDrawingView(container, st)` & `bindInteractiveCanvas(canvas, groupId)`: baris `1000–1499`
-- `renderGuessingView(container, st)` & `bindGuessFormEvents()`: baris `1557–1851`
-- `renderRevealView(container, st)` & `renderLeaderboardView(container, st)`: baris `1857–2079`
+- `STORAGE_KEYS`, `getOrCreateDeviceId()`, & objek `client` (termasuk `playerToken`): baris `3–51`
+- `connectWebSocket()` (Handler `IDENTIFY` dengan `playerToken`, `PLAYER_KICKED`, `ACTION_RESULT`, `STATE_UPDATE`, `STROKE_STREAM`): baris `92–170`
+- `sendAction(action, payload)` (`AbortController` 10 detik + retry otomatis maks 2x untuk `JOIN_PLAYER` + header `X-Player-Token`): baris `173–250`
+- `sendStrokeSegmentWS(groupId, segment)` (Pengirim goresan WebSocket dengan `playerToken`): baris `253–278`
+- `syncSessionWithState(state)` & `handleStateUpdate(newState)`: baris `281–460`
+- `renderEntryView(container)` (Form `JOIN_PLAYER` & penyimpanan `playerToken`): baris `653–755`
+- `renderDrawingView(container, st)` & `bindInteractiveCanvas(canvas, groupId)`: baris `1110–1675`
+- `renderGuessingView(container, st)` & `bindGuessFormEvents()`: baris `1796–2060`
+- `renderRevealView(container, st)` & `renderLeaderboardView(container, st)`: baris `2065–2295`
 
 ### 6.3 `words.js` (Word Bank & Bot Stroke Generator)
 - `DEFAULT_WORDS` (78 kata objek 1-kata Bahasa Indonesia): baris `3–22`

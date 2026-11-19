@@ -4,6 +4,7 @@
     DEVICE_ID: "tinta_estafet_device_id",
     ROLE: "tinta_estafet_role",
     PLAYER_ID: "tinta_estafet_player_id",
+    PLAYER_TOKEN: "tinta_estafet_player_token",
     PLAYER_NAME: "tinta_estafet_player_name",
     GM_PIN: "tinta_estafet_gm_pin",
     CUSTOM_INVITE_URL: "tinta_estafet_invite_url"
@@ -30,10 +31,12 @@
     deviceId: getOrCreateDeviceId(),
     role: localStorage.getItem(STORAGE_KEYS.ROLE) || null, // null | "player" | "game_master"
     playerId: localStorage.getItem(STORAGE_KEYS.PLAYER_ID) || null,
+    playerToken: localStorage.getItem(STORAGE_KEYS.PLAYER_TOKEN) || "",
     playerName: localStorage.getItem(STORAGE_KEYS.PLAYER_NAME) || "",
     gmPin: localStorage.getItem(STORAGE_KEYS.GM_PIN) || "",
     state: null,
     ws: null,
+    recoveringBoundToken: false,
     selectedColor: "#000000",
     selectedBrushSize: 6,
     isEraser: false,
@@ -95,15 +98,26 @@
     client.ws = ws;
 
     ws.addEventListener("open", () => {
-      ws.send(
-        JSON.stringify({
-          type: "IDENTIFY",
-          role: client.role || "player",
-          playerId: client.playerId,
-          deviceId: client.deviceId,
-          pin: client.gmPin
-        })
-      );
+      if (client.role === "game_master" && client.gmPin) {
+        ws.send(
+          JSON.stringify({
+            type: "IDENTIFY",
+            role: "game_master",
+            deviceId: client.deviceId,
+            pin: client.gmPin
+          })
+        );
+      } else if (client.playerId && client.playerToken) {
+        ws.send(
+          JSON.stringify({
+            type: "IDENTIFY",
+            role: "player",
+            playerId: client.playerId,
+            playerToken: client.playerToken,
+            deviceId: client.deviceId
+          })
+        );
+      }
     });
 
     ws.addEventListener("message", (ev) => {
@@ -113,10 +127,30 @@
           if (client.role === "player" && (!msg.playerId || msg.playerId === client.playerId)) {
             client.role = null;
             client.playerId = null;
+            client.playerToken = "";
             localStorage.removeItem(STORAGE_KEYS.ROLE);
             localStorage.removeItem(STORAGE_KEYS.PLAYER_ID);
+            localStorage.removeItem(STORAGE_KEYS.PLAYER_TOKEN);
             showToast(msg.message || "Kamu telah dikeluarkan oleh Game Master.", "#f43f5e");
             playTone(300, 0.2, "sawtooth");
+            client.renderedViewKey = "";
+            updateTopbar();
+            renderMainView();
+          }
+          return;
+        }
+        if (
+          msg.type === "ACTION_RESULT" &&
+          msg.action === "IDENTIFY" &&
+          (msg.ok === false || (msg.result && msg.result.ok === false))
+        ) {
+          if (client.role === "player") {
+            client.role = null;
+            client.playerId = null;
+            client.playerToken = "";
+            localStorage.removeItem(STORAGE_KEYS.ROLE);
+            localStorage.removeItem(STORAGE_KEYS.PLAYER_ID);
+            localStorage.removeItem(STORAGE_KEYS.PLAYER_TOKEN);
             client.renderedViewKey = "";
             updateTopbar();
             renderMainView();
@@ -136,44 +170,85 @@
     });
   }
 
-  // Mengirim Action ke Server (via HTTP POST agar selalu mendapat callback result langsung + memicu WS broadcast)
+  // Mengirim Action ke Server (via HTTP POST dengan AbortController 10 detik & retry otomatis untuk JOIN_PLAYER)
+  const ACTION_TIMEOUT_MS = 10000;
+
   async function sendAction(action, payload = {}) {
-    try {
-      const headers = { "Content-Type": "application/json" };
-      if (client.role === "game_master" && client.gmPin) {
-        headers["X-GM-Pin"] = client.gmPin;
+    const maxRetries = action === "JOIN_PLAYER" ? 2 : 0;
+    let attempt = 0;
+
+    while (attempt <= maxRetries) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), ACTION_TIMEOUT_MS);
+
+      try {
+        const headers = { "Content-Type": "application/json" };
+        if (client.role === "game_master" && client.gmPin) {
+          headers["X-GM-Pin"] = client.gmPin;
+        }
+        if (client.playerToken) {
+          headers["X-Player-Token"] = client.playerToken;
+        }
+
+        const resp = await fetch("/api/action", {
+          method: "POST",
+          headers,
+          signal: controller.signal,
+          body: JSON.stringify({
+            action,
+            payload: {
+              ...payload,
+              deviceId: client.deviceId,
+              playerToken: client.playerToken || undefined
+            },
+            role: client.role || "player",
+            playerId: client.playerId,
+            playerToken: client.playerToken || undefined,
+            deviceId: client.deviceId,
+            gmPin: client.role === "game_master" ? client.gmPin : ""
+          })
+        });
+        clearTimeout(timeoutId);
+
+        if (resp.status >= 500 && attempt < maxRetries) {
+          attempt++;
+          showToast("Koneksi lambat, mencoba lagi…", "#f59e0b");
+          await new Promise((r) => setTimeout(r, 800));
+          continue;
+        }
+
+        const data = await resp.json();
+        if (data.requireGmAuth && client.role === "game_master") {
+          client.role = null;
+          client.gmPin = "";
+          localStorage.removeItem(STORAGE_KEYS.ROLE);
+          localStorage.removeItem(STORAGE_KEYS.GM_PIN);
+          client.renderedViewKey = "";
+          showToast(data.error || "Sesi Game Master berakhir, silakan masukkan PIN baru.", "#f43f5e");
+          const modal = document.getElementById("gmPinModal");
+          if (modal) modal.classList.remove("hidden");
+        }
+        if (data.state) {
+          handleStateUpdate(data.state);
+        }
+        return data;
+      } catch (err) {
+        clearTimeout(timeoutId);
+        const isTimeout = err && err.name === "AbortError";
+        if (attempt < maxRetries) {
+          attempt++;
+          showToast("Koneksi lambat, mencoba lagi…", "#f59e0b");
+          await new Promise((r) => setTimeout(r, 800));
+          continue;
+        }
+        const failMsg = isTimeout
+          ? "Waktu koneksi habis (10 detik). Silakan tekan ulang untuk mencoba lagi."
+          : "Gagal menghubungi server. Silakan tekan ulang untuk mencoba lagi.";
+        showToast(failMsg, "#f43f5e");
+        return { ok: false, error: failMsg, isNetworkError: true };
       }
-      const resp = await fetch("/api/action", {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          action,
-          payload: { ...payload, deviceId: client.deviceId },
-          role: client.role || "player",
-          playerId: client.playerId,
-          deviceId: client.deviceId,
-          gmPin: client.role === "game_master" ? client.gmPin : ""
-        })
-      });
-      const data = await resp.json();
-      if (data.requireGmAuth && client.role === "game_master") {
-        client.role = null;
-        client.gmPin = "";
-        localStorage.removeItem(STORAGE_KEYS.ROLE);
-        localStorage.removeItem(STORAGE_KEYS.GM_PIN);
-        client.renderedViewKey = "";
-        showToast(data.error || "Sesi Game Master berakhir, silakan masukkan PIN baru.", "#f43f5e");
-        const modal = document.getElementById("gmPinModal");
-        if (modal) modal.classList.remove("hidden");
-      }
-      if (data.state) {
-        handleStateUpdate(data.state);
-      }
-      return data;
-    } catch (err) {
-      showToast("Gagal menghubungi server", "#f43f5e");
-      return { ok: false, error: err.message };
     }
+    return { ok: false, error: "Gagal menghubungi server." };
   }
 
   // Kirim segmen goresan langsung via WebSocket agar bebas latensi
@@ -185,15 +260,22 @@
           type: "ACTION",
           requestId,
           action: "DRAW_STROKE",
+          playerToken: client.playerToken,
           payload: {
             groupId,
             playerId: client.playerId,
+            playerToken: client.playerToken,
             segment
           }
         })
       );
     } else {
-      sendAction("DRAW_STROKE", { groupId, playerId: client.playerId, segment });
+      sendAction("DRAW_STROKE", {
+        groupId,
+        playerId: client.playerId,
+        playerToken: client.playerToken,
+        segment
+      });
     }
   }
 
@@ -208,8 +290,10 @@
         // kembalikan ke halaman masuk.
         client.role = null;
         client.playerId = null;
+        client.playerToken = "";
         localStorage.removeItem(STORAGE_KEYS.ROLE);
         localStorage.removeItem(STORAGE_KEYS.PLAYER_ID);
+        localStorage.removeItem(STORAGE_KEYS.PLAYER_TOKEN);
       }
     }
 
@@ -222,6 +306,34 @@
       localStorage.setItem(STORAGE_KEYS.ROLE, "player");
       localStorage.setItem(STORAGE_KEYS.PLAYER_ID, state.boundPlayer.id);
       localStorage.setItem(STORAGE_KEYS.PLAYER_NAME, state.boundPlayer.name);
+
+      if (!client.playerToken && !client.recoveringBoundToken) {
+        client.recoveringBoundToken = true;
+        sendAction("JOIN_PLAYER", {
+          name: state.boundPlayer.name,
+          playerId: state.boundPlayer.id
+        })
+          .then((res) => {
+            if (res && res.ok && res.playerToken) {
+              client.playerToken = res.playerToken;
+              localStorage.setItem(STORAGE_KEYS.PLAYER_TOKEN, res.playerToken);
+              if (client.ws && client.ws.readyState === WebSocket.OPEN) {
+                client.ws.send(
+                  JSON.stringify({
+                    type: "IDENTIFY",
+                    role: "player",
+                    playerId: client.playerId,
+                    playerToken: client.playerToken,
+                    deviceId: client.deviceId
+                  })
+                );
+              }
+            }
+          })
+          .finally(() => {
+            client.recoveringBoundToken = false;
+          });
+      }
     }
   }
 
@@ -585,33 +697,49 @@
       e.preventDefault();
       const name = document.getElementById("playerNameInput").value.trim();
       if (!name) return;
-      const res = await sendAction("JOIN_PLAYER", {
-        name,
-        playerId: client.playerId
-      });
-      if (!res.ok) {
-        showToast(res.error || "Gagal masuk", "#f43f5e");
-        return;
-      }
-      client.role = "player";
-      client.playerId = res.player.id;
-      client.playerName = res.player.name;
-      localStorage.setItem(STORAGE_KEYS.ROLE, "player");
-      localStorage.setItem(STORAGE_KEYS.PLAYER_ID, res.player.id);
-      localStorage.setItem(STORAGE_KEYS.PLAYER_NAME, res.player.name);
+      const submitBtn = form.querySelector('button[type="submit"]');
+      if (submitBtn && submitBtn.disabled) return;
+      if (submitBtn) submitBtn.disabled = true;
 
-      if (client.ws && client.ws.readyState === WebSocket.OPEN) {
-        client.ws.send(
-          JSON.stringify({
-            type: "IDENTIFY",
-            role: "player",
-            playerId: client.playerId
-          })
-        );
+      try {
+        const res = await sendAction("JOIN_PLAYER", {
+          name,
+          playerId: client.playerId
+        });
+        if (!res.ok) {
+          if (!res.isNetworkError) {
+            showToast(res.error || "Gagal masuk", "#f43f5e");
+          }
+          return;
+        }
+        client.role = "player";
+        client.playerId = res.player.id;
+        client.playerToken = res.playerToken || client.playerToken || "";
+        client.playerName = res.player.name;
+        localStorage.setItem(STORAGE_KEYS.ROLE, "player");
+        localStorage.setItem(STORAGE_KEYS.PLAYER_ID, res.player.id);
+        if (client.playerToken) {
+          localStorage.setItem(STORAGE_KEYS.PLAYER_TOKEN, client.playerToken);
+        }
+        localStorage.setItem(STORAGE_KEYS.PLAYER_NAME, res.player.name);
+
+        if (client.ws && client.ws.readyState === WebSocket.OPEN) {
+          client.ws.send(
+            JSON.stringify({
+              type: "IDENTIFY",
+              role: "player",
+              playerId: client.playerId,
+              playerToken: client.playerToken,
+              deviceId: client.deviceId
+            })
+          );
+        }
+        playTone(640, 0.15);
+        client.renderedViewKey = "";
+        renderMainView();
+      } finally {
+        if (submitBtn) submitBtn.disabled = false;
       }
-      playTone(640, 0.15);
-      client.renderedViewKey = "";
-      renderMainView();
     });
 
     document.getElementById("openGmAuthBtn").addEventListener("click", () => {
@@ -1317,9 +1445,21 @@
 
       const passBtn = document.getElementById("passTurnBtn");
       if (passBtn) {
-        passBtn.addEventListener("click", () => {
+        passBtn.addEventListener("click", async () => {
+          if (passBtn.disabled) return;
+          passBtn.disabled = true;
           playTone(440, 0.1);
-          sendAction("PASS_TURN", { groupId: myGroup.id, playerId: client.playerId });
+          const res = await sendAction("PASS_TURN", {
+            groupId: myGroup.id,
+            playerId: client.playerId,
+            playerToken: client.playerToken
+          });
+          if (!res || !res.ok) {
+            passBtn.disabled = false;
+            if (res && !res.isNetworkError) {
+              showToast(res.error || "Gagal mengoper giliran. Silakan coba lagi.", "#f43f5e");
+            }
+          }
         });
       }
     }
@@ -1851,35 +1991,56 @@
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       const input = document.getElementById("guessTextInput");
+      const submitBtn = form.querySelector('button[type="submit"]');
+      if (submitBtn && submitBtn.disabled) return;
       const text = input.value.trim();
       if (!text) return;
       input.value = "";
+      if (submitBtn) submitBtn.disabled = true;
 
-      const res = await sendAction("SUBMIT_GUESS", {
-        playerId: client.playerId,
-        text
-      });
+      try {
+        const res = await sendAction("SUBMIT_GUESS", {
+          playerId: client.playerId,
+          playerToken: client.playerToken,
+          text
+        });
 
-      const hintEl = document.getElementById("guessHintMsg");
-      if (res.isCorrect) {
-        playTone(880, 0.25);
-        showToast(
-          `🎉 Tebakanmu BENAR! Tercepat #${res.rank || 1} (+${res.pointsEarned || 30} Poin untuk grupmu!)`,
-          "#10b981"
-        );
-      } else if (res.isClose) {
-        playTone(580, 0.18);
-        showToast(
-          `🔥 Hampir benar! Jawabanmu "${text}" sudah sangat mendekati! (Cukup 1 kata)`,
-          "#f59e0b"
-        );
-        if (hintEl) {
-          hintEl.style.color = "#fde68a";
-          hintEl.textContent = `🔥 Hampir benar! Jawabanmu ("${text}") sudah mendekati — cukup ketik 1 kata utamanya & cek ejaanmu! (Hanya terlihat olehmu)`;
+        const hintEl = document.getElementById("guessHintMsg");
+        if (!res || !res.ok) {
+          input.value = text;
+          if (hintEl) {
+            hintEl.style.color = "#f87171";
+            hintEl.textContent =
+              (res && res.error) || "⚠️ Gagal mengirim tebakan. Silakan tekan Kirim lagi.";
+          }
+          if (res && !res.isNetworkError) {
+            showToast(res.error || "Gagal mengirim tebakan", "#f43f5e");
+          }
+          return;
         }
-      } else if (hintEl) {
-        hintEl.style.color = "#f87171";
-        hintEl.textContent = "❌ Belum tepat, coba tebak lagi!";
+
+        if (res.isCorrect) {
+          playTone(880, 0.25);
+          showToast(
+            `🎉 Tebakanmu BENAR! Tercepat #${res.rank || 1} (+${res.pointsEarned || 30} Poin untuk grupmu!)`,
+            "#10b981"
+          );
+        } else if (res.isClose) {
+          playTone(580, 0.18);
+          showToast(
+            `🔥 Hampir benar! Jawabanmu "${text}" sudah sangat mendekati! (Cukup 1 kata)`,
+            "#f59e0b"
+          );
+          if (hintEl) {
+            hintEl.style.color = "#fde68a";
+            hintEl.textContent = `🔥 Hampir benar! Jawabanmu ("${text}") sudah mendekati — cukup ketik 1 kata utamanya & cek ejaanmu! (Hanya terlihat olehmu)`;
+          }
+        } else if (hintEl) {
+          hintEl.style.color = "#f87171";
+          hintEl.textContent = "❌ Belum tepat, coba tebak lagi!";
+        }
+      } finally {
+        if (submitBtn) submitBtn.disabled = false;
       }
     });
   }
@@ -2192,14 +2353,18 @@
     const pin = document.getElementById("gmPinInput").value.trim();
     const res = await sendAction("AUTH_GM", { pin, playerId: client.playerId });
     if (!res.ok) {
-      showToast(res.error || "PIN Salah!", "#f43f5e");
+      if (!res.isNetworkError) {
+        showToast(res.error || "PIN Salah!", "#f43f5e");
+      }
       return;
     }
     client.role = "game_master";
     client.playerId = null;
+    client.playerToken = "";
     client.gmPin = pin;
     localStorage.setItem(STORAGE_KEYS.ROLE, "game_master");
     localStorage.removeItem(STORAGE_KEYS.PLAYER_ID);
+    localStorage.removeItem(STORAGE_KEYS.PLAYER_TOKEN);
     localStorage.setItem(STORAGE_KEYS.GM_PIN, pin);
     document.getElementById("gmPinModal").classList.add("hidden");
     document.getElementById("gmPinInput").value = "";
@@ -2270,8 +2435,13 @@
   // Inisialisasi aplikasi
   setInterval(updateDrawingTimersDOM, 250);
   connectWebSocket();
-  const initHeaders =
-    client.role === "game_master" && client.gmPin ? { "X-GM-Pin": client.gmPin } : {};
+  const initHeaders = {};
+  if (client.role === "game_master" && client.gmPin) {
+    initHeaders["X-GM-Pin"] = client.gmPin;
+  }
+  if (client.playerToken) {
+    initHeaders["X-Player-Token"] = client.playerToken;
+  }
   fetch(
     `/api/state?role=${encodeURIComponent(client.role || "player")}&playerId=${encodeURIComponent(
       client.playerId || ""
