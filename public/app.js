@@ -42,6 +42,7 @@
     gmShowSecretWords: false, // Default sembunyikan kata rahasia di layar proyektor GM
     renderedViewKey: "",
     renderedStrokeCount: 0,
+    serverTimeOffset: 0,
     customInviteUrl: localStorage.getItem(STORAGE_KEYS.CUSTOM_INVITE_URL) || ""
   };
 
@@ -137,18 +138,33 @@
   // Mengirim Action ke Server (via HTTP POST agar selalu mendapat callback result langsung + memicu WS broadcast)
   async function sendAction(action, payload = {}) {
     try {
+      const headers = { "Content-Type": "application/json" };
+      if (client.role === "game_master" && client.gmPin) {
+        headers["X-GM-Pin"] = client.gmPin;
+      }
       const resp = await fetch("/api/action", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({
           action,
           payload: { ...payload, deviceId: client.deviceId },
           role: client.role || "player",
           playerId: client.playerId,
-          deviceId: client.deviceId
+          deviceId: client.deviceId,
+          gmPin: client.role === "game_master" ? client.gmPin : ""
         })
       });
       const data = await resp.json();
+      if (data.requireGmAuth && client.role === "game_master") {
+        client.role = null;
+        client.gmPin = "";
+        localStorage.removeItem(STORAGE_KEYS.ROLE);
+        localStorage.removeItem(STORAGE_KEYS.GM_PIN);
+        client.renderedViewKey = "";
+        showToast(data.error || "Sesi Game Master berakhir, silakan masukkan PIN baru.", "#f43f5e");
+        const modal = document.getElementById("gmPinModal");
+        if (modal) modal.classList.remove("hidden");
+      }
       if (data.state) {
         handleStateUpdate(data.state);
       }
@@ -208,6 +224,10 @@
 
   function handleStateUpdate(newState) {
     const prevState = client.state;
+
+    if (newState && typeof newState.serverTime === "number") {
+      client.serverTimeOffset = newState.serverTime - Date.now();
+    }
 
     // Jika server mengirim state ringan (strokesOmitted) saat menebak gambar,
     // pertahankan data strokes kanvas yang sudah ada di memori browser agar hemat bandwidth
@@ -992,7 +1012,7 @@
         : 0;
 
     container.innerHTML = `
-      <div class="grid-sidebar">
+      <div class="grid-sidebar canvas-first-mobile">
         <!-- Info Grup, Kata Rahasia & Urutan Giliran -->
         <div style="display:flex;flex-direction:column;gap:14px;">
           <div class="card" style="border-top:4px solid ${myGroup.color};">
@@ -1077,7 +1097,8 @@
         <!-- Area Kanvas & Toolbar -->
         <div class="card">
           <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:10px;">
-            <div>
+            <div style="display:flex;align-items:center;flex-wrap:wrap;gap:8px;">
+              <span class="mobile-only-word-pill">🎯 ${escapeHtml(myGroup.secretWord)}</span>
               <strong style="font-size:1.05rem;">
                 ${
                   myGroup.status === "FINISHED"
@@ -1240,7 +1261,7 @@
           <div class="card" style="padding:14px;border-top:4px solid ${g.color};">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
               <strong>${escapeHtml(g.fullName)}</strong>
-              <span class="pill" style="font-size:0.75rem;">
+              <span id="gmGroupStatusPill-${g.id}" class="pill" style="font-size:0.75rem;">
                 ${
                   g.status === "FINISHED"
                     ? "✅ Selesai"
@@ -1334,13 +1355,37 @@
     });
   }
 
-  function updateDrawingViewInPlace() {
+  function updateDrawingTimersDOM() {
     const st = client.state;
-    if (!st) return;
+    if (!st || st.phase !== "DRAWING") return;
+
+    const estServerNow = Date.now() + (client.serverTimeOffset || 0);
+    st.groups.forEach((g) => {
+      if (g.status === "COUNTDOWN" && g.countdownEndAt) {
+        g.countdownRemainingSec = Math.max(0, Math.ceil((g.countdownEndAt - estServerNow) / 1000));
+      } else if (
+        g.status === "DRAWING" &&
+        st.settings.turnDurationSeconds > 0 &&
+        g.turnEndAt > 0
+      ) {
+        g.turnRemainingSec = Math.max(0, Math.ceil((g.turnEndAt - estServerNow) / 1000));
+      }
+    });
 
     if (client.role === "game_master") {
       st.groups.forEach((g) => {
-        updateInkMetersDOM(g.id);
+        const pill = document.getElementById(`gmGroupStatusPill-${g.id}`);
+        if (!pill) return;
+        const turnTimeLabel =
+          st.settings.turnDurationSeconds === 0 || g.turnRemainingSec === null
+            ? "♾️ Tanpa Batas Waktu"
+            : `${g.turnRemainingSec}d`;
+        pill.textContent =
+          g.status === "FINISHED"
+            ? "✅ Selesai"
+            : g.status === "COUNTDOWN"
+            ? `⏳ Siap (${g.countdownRemainingSec}d): ${g.activePlayerName || "-"}`
+            : `🎨 ${g.activePlayerName || "-"} (${turnTimeLabel})`;
       });
       return;
     }
@@ -1365,6 +1410,24 @@
     if (countdownNumber) {
       countdownNumber.textContent = String(myGroup.countdownRemainingSec);
     }
+  }
+
+  function updateDrawingViewInPlace() {
+    const st = client.state;
+    if (!st) return;
+
+    updateDrawingTimersDOM();
+
+    if (client.role === "game_master") {
+      st.groups.forEach((g) => {
+        updateInkMetersDOM(g.id);
+      });
+      return;
+    }
+
+    const me = st.players.find((p) => p.id === client.playerId);
+    const myGroup = me ? st.groups.find((g) => g.id === me.groupId) : null;
+    if (!myGroup) return;
 
     updateInkMetersDOM(myGroup.id);
   }
@@ -1558,7 +1621,7 @@
     const nextGuessPoints = Math.max(5, 30 - targetGroup.correctGuessers.length * 3);
 
     container.innerHTML = `
-      <div class="grid-sidebar">
+      <div class="grid-sidebar canvas-first-mobile">
         <!-- Panel Kiri: Input Tebakan & Live Feed -->
         <div style="display:flex;flex-direction:column;gap:14px;">
           <div class="card" style="border-top:4px solid ${targetGroup.color};">
@@ -2117,14 +2180,24 @@
   }
 
   // Inisialisasi aplikasi
+  setInterval(updateDrawingTimersDOM, 250);
   connectWebSocket();
+  const initHeaders =
+    client.role === "game_master" && client.gmPin ? { "X-GM-Pin": client.gmPin } : {};
   fetch(
     `/api/state?role=${encodeURIComponent(client.role || "player")}&playerId=${encodeURIComponent(
       client.playerId || ""
-    )}&deviceId=${encodeURIComponent(client.deviceId || "")}`
+    )}&deviceId=${encodeURIComponent(client.deviceId || "")}`,
+    { headers: initHeaders }
   )
     .then((r) => r.json())
     .then((data) => {
+      if (client.role === "game_master" && data && data.gmVerified === false) {
+        client.role = null;
+        client.gmPin = "";
+        localStorage.removeItem(STORAGE_KEYS.ROLE);
+        localStorage.removeItem(STORAGE_KEYS.GM_PIN);
+      }
       if (data.state) handleStateUpdate(data.state);
     })
     .catch(() => {});

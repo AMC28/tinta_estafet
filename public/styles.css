@@ -148,6 +148,49 @@ body {
   .grid-sidebar {
     grid-template-columns: 1fr;
   }
+
+  .grid-sidebar.canvas-first-mobile > :last-child {
+    order: -1;
+  }
+
+  .toast-container {
+    top: 14px;
+    bottom: auto;
+    right: 12px;
+    left: 12px;
+  }
+
+  .mobile-only-word-pill {
+    display: inline-flex !important;
+  }
+}
+
+@media (max-width: 600px) {
+  .app-shell {
+    padding: 10px;
+  }
+
+  .topbar {
+    padding: 10px 14px;
+    margin-bottom: 12px;
+  }
+
+  .card {
+    padding: 14px;
+  }
+}
+
+.mobile-only-word-pill {
+  display: none;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(245, 158, 11, 0.2);
+  border: 1px solid rgba(245, 158, 11, 0.5);
+  color: #fde68a;
+  font-size: 0.84rem;
+  font-weight: 800;
 }
 
 /* Buttons & Inputs */
@@ -421,6 +464,7 @@ body {
 .brush-buttons {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
 }
 

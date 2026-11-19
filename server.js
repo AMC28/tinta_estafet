@@ -892,6 +892,8 @@ function buildClientState(role, playerId, deviceId = null, options = {}) {
       activePlayerId: activeMember ? activeMember.id : null,
       activePlayerName: activeMember ? activeMember.name : null,
       status: g.status,
+      countdownEndAt: g.countdownEndAt || 0,
+      turnEndAt: g.turnEndAt || 0,
       countdownRemainingSec:
         g.status === "COUNTDOWN"
           ? Math.max(0, Math.ceil((g.countdownEndAt - now) / 1000))
@@ -1008,8 +1010,47 @@ function broadcastStroke(groupId, segment, inkInfo) {
   }
 }
 
+// Daftar action yang HANYA boleh dijalankan oleh Game Master / Admin yang sudah terverifikasi PIN
+const GM_ONLY_ACTIONS = new Set([
+  "UPDATE_SETTINGS",
+  "RESHUFFLE_GROUPS",
+  "MOVE_PLAYER_GROUP",
+  "MOVE_PLAYER_ORDER",
+  "ADD_BOT",
+  "REMOVE_BOTS",
+  "KICK_PLAYER",
+  "UPDATE_WORD_BANK",
+  "START_DRAWING_PHASE",
+  "GM_SKIP_MEMBER_TURN",
+  "FORCE_FINISH_DRAWING",
+  "START_GUESSING_PHASE",
+  "TOGGLE_CLUE",
+  "ADD_CLUE_LETTER",
+  "REVEAL_CURRENT_GROUP",
+  "NEXT_GUESS_GROUP",
+  "SHOW_LEADERBOARD",
+  "NEXT_ROUND",
+  "RETURN_TO_LOBBY",
+  "RESET_GAME"
+]);
+
 // Handler untuk seluruh Action dari Player maupun Game Master
 function handleAction(action, payload, clientMeta) {
+  if (GM_ONLY_ACTIONS.has(action)) {
+    const isVerifiedGM = Boolean(
+      clientMeta &&
+        (clientMeta.role === "game_master" ||
+          (clientMeta.gmPin && clientMeta.gmPin === GM_DEFAULT_PIN))
+    );
+    if (!isVerifiedGM) {
+      return {
+        ok: false,
+        requireGmAuth: true,
+        error: "Akses ditolak. Aksi ini khusus Game Master (silakan login ulang dengan PIN terbaru)."
+      };
+    }
+  }
+
   switch (action) {
     case "JOIN_PLAYER": {
       const name = String(payload.name || "").trim().slice(0, 24);
@@ -1544,7 +1585,14 @@ const server = http.createServer((req, res) => {
 
   // Endpoint API State (GET)
   if (pathname === "/api/state" && req.method === "GET") {
-    const role = parsedUrl.searchParams.get("role") || "player";
+    const requestedRole = parsedUrl.searchParams.get("role") || "player";
+    const gmPin = String(
+      req.headers["x-gm-pin"] || parsedUrl.searchParams.get("pin") || ""
+    ).trim();
+    const verifiedRole =
+      requestedRole === "game_master" && gmPin === GM_DEFAULT_PIN
+        ? "game_master"
+        : "player";
     const playerId = parsedUrl.searchParams.get("playerId") || null;
     const deviceId = parsedUrl.searchParams.get("deviceId") || cookieDeviceId;
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
@@ -1552,7 +1600,8 @@ const server = http.createServer((req, res) => {
       JSON.stringify({
         ok: true,
         deviceId,
-        state: buildClientState(role, playerId, deviceId)
+        gmVerified: verifiedRole === "game_master",
+        state: buildClientState(verifiedRole, playerId, deviceId)
       })
     );
     return;
@@ -1570,8 +1619,26 @@ const server = http.createServer((req, res) => {
         const data = JSON.parse(body || "{}");
         const deviceId =
           (data.payload && data.payload.deviceId) || data.deviceId || cookieDeviceId;
+        const gmPin = String(
+          req.headers["x-gm-pin"] ||
+            data.gmPin ||
+            (data.payload && data.payload.gmPin) ||
+            ""
+        ).trim();
+        const verifiedRole =
+          data.role === "game_master" && gmPin === GM_DEFAULT_PIN
+            ? "game_master"
+            : "player";
         const payloadWithDevice = { ...(data.payload || {}), deviceId };
-        const result = handleAction(data.action, payloadWithDevice, { deviceId });
+        const result = handleAction(data.action, payloadWithDevice, {
+          deviceId,
+          role: verifiedRole,
+          gmPin
+        });
+        const finalRole =
+          result && result.ok && result.role === "game_master"
+            ? "game_master"
+            : verifiedRole;
         const finalPlayerId =
           (result.player && result.player.id) || data.playerId || null;
         const omitStrokes =
@@ -1583,7 +1650,7 @@ const server = http.createServer((req, res) => {
           JSON.stringify({
             ...result,
             deviceId,
-            state: buildClientState(data.role || "player", finalPlayerId, deviceId, {
+            state: buildClientState(finalRole, finalPlayerId, deviceId, {
               omitStrokes
             })
           })
