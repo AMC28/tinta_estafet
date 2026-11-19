@@ -416,7 +416,7 @@ function applyStrokeSegment(groupId, playerId, segment) {
 }
 
 // Menangani tombol Pass atau saat waktu/tinta seorang pemain habis
-function handlePassTurn(groupId, playerId, isManualPass = true) {
+function handlePassTurn(groupId, playerId, isManualPass = true, shouldBroadcast = true) {
   const group = gameState.groups.find((g) => g.id === groupId);
   if (!group || group.status === "FINISHED") return;
 
@@ -442,7 +442,10 @@ function handlePassTurn(groupId, playerId, isManualPass = true) {
 
   group.turnInkRemaining = 0;
   startGroupMemberTurn(group, group.currentTurnIndex + 1, true);
-  broadcastState();
+  if (shouldBroadcast) {
+    // Klien sudah menerima goresan lewat STROKE_STREAM -> gunakan omitStrokes: true
+    broadcastState({ omitStrokes: true });
+  }
 }
 
 function checkAllGroupsFinishedDrawing() {
@@ -453,7 +456,6 @@ function checkAllGroupsFinishedDrawing() {
 
   if (allDone) {
     gameState.phase = "READY_TO_GUESS";
-    broadcastState();
   }
 }
 
@@ -776,16 +778,17 @@ function startServerGameLoop() {
         group.turnEndAt > 0 &&
         now >= group.turnEndAt
       ) {
-        // Waktu giliran habis -> otomatis lanjut ke anggota berikutnya
+        // Waktu giliran habis -> otomatis lanjut ke anggota berikutnya (tunda broadcast ke akhir loop)
         const members = getGroupMembers(group.id);
         const activePlayer = members[group.currentTurnIndex];
-        handlePassTurn(group.id, activePlayer ? activePlayer.id : null, false);
+        handlePassTurn(group.id, activePlayer ? activePlayer.id : null, false, false);
         changed = true;
       }
     });
 
     if (changed) {
-      broadcastState();
+      // Klien sudah menerima goresan lewat STROKE_STREAM -> kirim status giliran & tinta saja
+      broadcastState({ omitStrokes: true });
     }
   }, 200);
 
@@ -1099,7 +1102,7 @@ function handleAction(action, payload, clientMeta) {
         clientMeta.playerId = player.id;
         if (player.deviceId) clientMeta.deviceId = player.deviceId;
       }
-      broadcastState();
+      broadcastState({ omitStrokes: true });
       return { ok: true, player };
     }
 
@@ -1127,7 +1130,7 @@ function handleAction(action, payload, clientMeta) {
         clientMeta.role = "game_master";
         clientMeta.playerId = null;
       }
-      broadcastState();
+      broadcastState({ omitStrokes: true });
       return { ok: true, role: "game_master" };
     }
 
@@ -1334,7 +1337,7 @@ function handleAction(action, payload, clientMeta) {
         }
       }
 
-      broadcastState();
+      broadcastState({ omitStrokes: true });
       return { ok: true, kickedName: targetPlayer.name };
     }
 
@@ -1355,7 +1358,7 @@ function handleAction(action, payload, clientMeta) {
       }
       gameState.customWords = cleaned;
       gameState.usedWords.clear();
-      broadcastState();
+      broadcastState({ omitStrokes: true });
       return { ok: true, count: cleaned.length };
     }
 
@@ -1407,7 +1410,7 @@ function handleAction(action, payload, clientMeta) {
 
       group.turnInkRemaining = 0;
       startGroupMemberTurn(group, group.currentTurnIndex + 1, true);
-      broadcastState();
+      broadcastState({ omitStrokes: true });
       return {
         ok: true,
         skippedName: skippedMember ? skippedMember.name : "Pemain",
@@ -1420,7 +1423,7 @@ function handleAction(action, payload, clientMeta) {
         g.status = "FINISHED";
       });
       gameState.phase = "READY_TO_GUESS";
-      broadcastState();
+      broadcastState({ omitStrokes: true });
       return { ok: true };
     }
 
@@ -1672,17 +1675,15 @@ const server = http.createServer((req, res) => {
             : verifiedRole;
         const finalPlayerId =
           (result.player && result.player.id) || data.playerId || null;
-        const omitStrokes =
-          data.action === "SUBMIT_GUESS" ||
-          data.action === "TOGGLE_CLUE" ||
-          data.action === "ADD_CLUE_LETTER";
+        // Response POST /api/action selalu memakai omitStrokes: true agar hemat payload;
+        // strokes lengkap dikirim melalui WebSocket saat transisi fase yang memerlukannya
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(
           JSON.stringify({
             ...result,
             deviceId,
             state: buildClientState(finalRole, finalPlayerId, deviceId, {
-              omitStrokes
+              omitStrokes: true
             })
           })
         );
@@ -1757,10 +1758,12 @@ server.on("upgrade", (req, socket) => {
   };
   wsClients.set(socket, clientMeta);
 
-  // Kirim state awal
+  // Kirim state awal ringan; strokes lengkap akan dikirim sebagai balasan IDENTIFY
   sendWsMessage(socket, {
     type: "STATE_UPDATE",
-    state: buildClientState(clientMeta.role, clientMeta.playerId, clientMeta.deviceId)
+    state: buildClientState(clientMeta.role, clientMeta.playerId, clientMeta.deviceId, {
+      omitStrokes: true
+    })
   });
 
   let buffer = Buffer.alloc(0);
@@ -1844,10 +1847,17 @@ server.on("upgrade", (req, socket) => {
               )
             });
           } else if (msg.type === "ACTION") {
-            const res = handleAction(msg.action, msg.payload || {}, clientMeta);
+            const actionPayload = msg.payload || {};
+            const reflectedRequestId =
+              msg.requestId !== undefined
+                ? msg.requestId
+                : actionPayload.requestId !== undefined
+                ? actionPayload.requestId
+                : null;
+            const res = handleAction(msg.action, actionPayload, clientMeta);
             sendWsMessage(socket, {
               type: "ACTION_RESULT",
-              requestId: msg.requestId,
+              requestId: reflectedRequestId,
               action: msg.action,
               result: res
             });

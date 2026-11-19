@@ -42,6 +42,7 @@
     gmShowSecretWords: false, // Default sembunyikan kata rahasia di layar proyektor GM
     renderedViewKey: "",
     renderedStrokeCount: 0,
+    strokeReqSeq: 0,
     serverTimeOffset: 0,
     customInviteUrl: localStorage.getItem(STORAGE_KEYS.CUSTOM_INVITE_URL) || ""
   };
@@ -177,10 +178,12 @@
 
   // Kirim segmen goresan langsung via WebSocket agar bebas latensi
   function sendStrokeSegmentWS(groupId, segment) {
+    const requestId = `stroke-${++client.strokeReqSeq}`;
     if (client.ws && client.ws.readyState === WebSocket.OPEN) {
       client.ws.send(
         JSON.stringify({
           type: "ACTION",
+          requestId,
           action: "DRAW_STROKE",
           payload: {
             groupId,
@@ -229,16 +232,20 @@
       client.serverTimeOffset = newState.serverTime - Date.now();
     }
 
-    // Jika server mengirim state ringan (strokesOmitted) saat menebak gambar,
+    // Jika server mengirim state ringan (strokesOmitted),
     // pertahankan data strokes kanvas yang sudah ada di memori browser agar hemat bandwidth
-    if (
-      newState &&
-      newState.strokesOmitted &&
-      prevState &&
-      Array.isArray(prevState.groups) &&
-      Array.isArray(newState.groups)
-    ) {
+    if (newState && newState.strokesOmitted && Array.isArray(newState.groups)) {
+      const shouldResetStrokes =
+        newState.phase === "LOBBY" ||
+        !prevState ||
+        prevState.phase === "LOBBY" ||
+        prevState.roundNumber !== newState.roundNumber;
+
       newState.groups.forEach((g) => {
+        if (shouldResetStrokes || !Array.isArray(prevState.groups)) {
+          g.strokes = [];
+          return;
+        }
         const prevG = prevState.groups.find((pg) => pg.id === g.id);
         if (prevG && Array.isArray(prevG.strokes)) {
           g.strokes = prevG.strokes;
@@ -1429,6 +1436,10 @@
     if (client.role === "game_master") {
       st.groups.forEach((g) => {
         updateInkMetersDOM(g.id);
+        if (!st.strokesOmitted) {
+          const c = document.getElementById(`groupCanvas-${g.id}`);
+          renderAllStrokesOnCanvas(c, g.strokes);
+        }
       });
       return;
     }
@@ -1438,6 +1449,10 @@
     if (!myGroup) return;
 
     updateInkMetersDOM(myGroup.id);
+    if (!st.strokesOmitted) {
+      const canvas = document.getElementById(`groupCanvas-${myGroup.id}`);
+      renderAllStrokesOnCanvas(canvas, myGroup.strokes);
+    }
   }
 
   // Binding event Mouse & Touch pada Canvas untuk menggambar secara halus
@@ -1848,6 +1863,11 @@
     const guessBoxArea = document.getElementById("guessBoxArea");
     if (guessBoxArea && myCorrectEntry && document.getElementById("submitGuessForm")) {
       guessBoxArea.innerHTML = renderGuessInputAreaHTML(myCorrectEntry);
+    }
+
+    if (!st.strokesOmitted) {
+      const guessCanvas = document.getElementById("guessCanvas");
+      renderAllStrokesOnCanvas(guessCanvas, targetGroup.strokes);
     }
   }
 

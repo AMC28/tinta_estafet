@@ -177,6 +177,7 @@ Dikirim via `POST /api/action` saat pengguna memasukkan PIN di modal Akses Game 
 ```json
 {
   "type": "ACTION",
+  "requestId": "stroke-1",
   "action": "DRAW_STROKE",
   "payload": {
     "groupId": 1,
@@ -703,7 +704,19 @@ Tombol *"🗑️ Reset Semua"* di halaman `LOBBY`: mengeluarkan (kick) semua pem
 ```
 
 #### B. `STATE_UPDATE` Ringan (`omitStrokes: true`)
-Dikirim saat `SUBMIT_GUESS`, `TOGGLE_CLUE`, dan `ADD_CLUE_LETTER`. Field `state.strokesOmitted` bernilai `true` dan properti `strokes` pada seluruh objek di `state.groups` dihilangkan (`undefined` saat `JSON.stringify`), sehingga klien mempertahankan array `strokes` yang sudah ada di memori browser (`public/app.js` baris `236–253`).
+Untuk mencegah lonjakan ukuran payload (130–257 KB per klien) saat pergantian giliran dan tebakan, server menggunakan `omitStrokes: true` (`state.strokesOmitted: true`, di mana properti `strokes` pada seluruh objek di `state.groups` bernilai `undefined` / tidak diserialisasi) pada kondisi berikut:
+1. **Selama fase `DRAWING`:** seluruh broadcast `STATE_UPDATE` akibat `PASS_TURN`, `GM_SKIP_MEMBER_TURN`, habisnya tinta/waktu giliran, transisi `COUNTDOWN` $\rightarrow$ `DRAWING` di game loop (`200 ms`), `FORCE_FINISH_DRAWING`, serta `JOIN_PLAYER` / `KICK_PLAYER`. Klien sudah menerima goresan secara *real-time* melalui `STROKE_STREAM` dan mempertahankan `g.strokes` di memori browser (`public/app.js` baris `235–257`).
+2. **Selama fase `GUESSING`:** saat peserta mengirim tebakan (`SUBMIT_GUESS`) atau Game Master mengubah Clue (`TOGGLE_CLUE`, `ADD_CLUE_LETTER`).
+3. **Seluruh HTTP Response `POST /api/action`:** response JSON dari `POST /api/action` selalu menggunakan `omitStrokes: true`.
+4. **Pesan `STATE_UPDATE` awal saat handshake `upgrade` WebSocket** (sebelum klien mengirim `IDENTIFY`).
+
+Sebaliknya, **`strokes` lengkap (`strokesOmitted: false`) HANYA dikirim saat:**
+- Balasan **`IDENTIFY`** via WebSocket (termasuk saat klien *reconnect* di tengah fase `DRAWING`, sehingga klien yang reconnect tetap melihat gambar utuh) serta `GET /api/state`.
+- Masuk ke fase **`GUESSING`** atau pindah ke grup tebakan berikutnya (`START_GUESSING_PHASE`, `NEXT_GUESS_GROUP` $\rightarrow$ `startGuessingForGroup`, hanya mengirim `strokes` untuk 1 grup yang sedang ditebak).
+- Masuk ke fase **`REVEAL`** (`REVEAL_CURRENT_GROUP`, hanya mengirim `strokes` untuk 1 grup yang sedang di-reveal).
+- Masuk ke fase **`LEADERBOARD`** (`SHOW_LEADERBOARD` atau `NEXT_GUESS_GROUP` setelah grup terakhir, mengirim `strokes` seluruh grup untuk galeri akhir).
+- Awal **`START_DRAWING_PHASE`** (saat `strokes` masing-masing grup baru di-reset menjadi `[]`).
+
 ```json
 {
   "type": "STATE_UPDATE",
@@ -753,7 +766,7 @@ Dikirim saat `SUBMIT_GUESS`, `TOGGLE_CLUE`, dan `ADD_CLUE_LETTER`. Field `state.
 ```
 
 #### C. `STROKE_STREAM` (Streaming Goresan Real-Time via WebSocket)
-Dikirim setiap kali ada 1 segmen goresan valid pada `applyStrokeSegment` (`server.js` baris `393–397` & `999–1011`).
+Dikirim setiap kali ada 1 segmen goresan valid pada `applyStrokeSegment` (`server.js` baris `393–397` & `1002–1014`).
 ```json
 {
   "type": "STROKE_STREAM",
@@ -777,7 +790,7 @@ Dikirim setiap kali ada 1 segmen goresan valid pada `applyStrokeSegment` (`serve
 ```
 
 #### D. `PLAYER_KICKED` (Notifikasi Dikeluarkan dari Room)
-Dikirim via WebSocket ke klien yang dikeluarkan lewat `KICK_PLAYER` atau `KICK_ALL_PLAYERS` (`server.js` baris `1311–1316` & `1572–1575`).
+Dikirim via WebSocket ke klien yang dikeluarkan lewat `KICK_PLAYER` atau `KICK_ALL_PLAYERS` (`server.js` baris `1313–1318` & `1574–1577`).
 ```json
 {
   "type": "PLAYER_KICKED",
@@ -787,16 +800,16 @@ Dikirim via WebSocket ke klien yang dikeluarkan lewat `KICK_PLAYER` atau `KICK_A
 ```
 
 #### E. `ACTION_RESULT` (Ack / Balasan Action via WebSocket & HTTP)
-- Bila klien mengirim `{ "type": "ACTION", ... }` via WebSocket (`server.js` baris `1845–1853`), server membalas ke socket tersebut:
+- Bila klien mengirim `{ "type": "ACTION", "requestId": "stroke-1", "action": "DRAW_STROKE", ... }` via WebSocket (`server.js` baris `1849–1864`), server memantulkan kembali `requestId` dari pesan klien (`msg.requestId` atau `msg.payload.requestId`, fallback `null` jika tidak dikirim) ke socket tersebut:
   ```json
   {
     "type": "ACTION_RESULT",
-    "requestId": "req-01",
+    "requestId": "stroke-1",
     "action": "DRAW_STROKE",
     "result": { "ok": true }
   }
   ```
-- Bila klien mengirim via `POST /api/action`, hasil ack maupun error dikembalikan langsung di HTTP Response JSON:
+- Bila klien mengirim via `POST /api/action`, hasil ack maupun error dikembalikan langsung di HTTP Response JSON dengan `state` yang selalu menggunakan `omitStrokes: true` (`state.strokesOmitted: true`):
   - **Contoh Ack Sukses `SUBMIT_GUESS` (Hampir Benar):**
     ```json
     {
@@ -805,7 +818,11 @@ Dikirim via WebSocket ke klien yang dikeluarkan lewat `KICK_PLAYER` atau `KICK_A
       "isFuzzyCorrect": false,
       "isClose": true,
       "deviceId": "dev-9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
-      "state": { "...objek buildClientState..." }
+      "state": {
+        "phase": "GUESSING",
+        "strokesOmitted": true,
+        "...": "..."
+      }
     }
     ```
   - **Contoh Error Validasi / Akses:**
@@ -815,26 +832,30 @@ Dikirim via WebSocket ke klien yang dikeluarkan lewat `KICK_PLAYER` atau `KICK_A
       "requireGmAuth": true,
       "error": "Akses ditolak. Aksi ini khusus Game Master (silakan login ulang dengan PIN terbaru).",
       "deviceId": "dev-9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
-      "state": { "...objek buildClientState..." }
+      "state": {
+        "phase": "LOBBY",
+        "strokesOmitted": true,
+        "...": "..."
+      }
     }
     ```
 
 #### F. Frame Control WebSocket: `Ping` & `Pong`
-- **Server $\rightarrow$ Klien (Keep-Alive Ping):** Setiap `25.000 ms` (`server.js` baris `793–803`), server menulis raw frame biner RFC 6455 Ping: `Buffer.from([0x89, 0x00])` (FIN + Opcode `0x9`, payload 0 byte).
-- **Klien $\rightarrow$ Server (`opcode === 0x9`):** Jika klien mengirim frame Ping, server langsung membalas raw frame Pong `Buffer.from([0x8a, 0x00])` (`server.js` baris `1802–1806`).
+- **Server $\rightarrow$ Klien (Keep-Alive Ping):** Setiap `25.000 ms` (`server.js` baris `795–805`), server menulis raw frame biner RFC 6455 Ping: `Buffer.from([0x89, 0x00])` (FIN + Opcode `0x9`, payload 0 byte).
+- **Klien $\rightarrow$ Server (`opcode === 0x9`):** Jika klien mengirim frame Ping, server langsung membalas raw frame Pong `Buffer.from([0x8a, 0x00])` (`server.js` baris `1806–1810`).
 
 ---
 
-### 3.2 Struktur State per Fase (`buildClientState` di `server.js` baris `807–954`)
+### 3.2 Struktur State per Fase (`buildClientState` di `server.js` baris `809–956`)
 
 | Fase (`state.phase`) | `group.secretWord` | `group.strokes` | `group.status` & Giliran Aktif |
 | :--- | :--- | :--- | :--- |
-| **`LOBBY`** | `"???"` untuk semua pemain (`""` bagi GM). | `[]` | `status: "WAITING"`, `currentTurnIndex: 0`, `activePlayerId` mengacu pada `members[0].id`. |
-| **`DRAWING`** | Terlihat **hanya** oleh anggota grup itu sendiri (`viewerGroupId === g.id`) dan `game_master`. Grup lain menerima `"???"`. | Dikirim **hanya** ke anggota grup itu sendiri (`viewerGroupId === g.id`) dan `game_master`. Grup lain menerima `[]`. | `status` bernilai `"COUNTDOWN"` (3 detik awal tiap giliran) $\rightarrow$ `"DRAWING"` $\rightarrow$ `"FINISHED"`. `currentTurnIndex` menunjuk indeks `0..members.length-1`, `activePlayerId` berisi `members[g.currentTurnIndex].id`. |
-| **`READY_TO_GUESS`** | `"???"` untuk semua pemain; terlihat oleh `game_master`. | `[]` untuk semua klien (termasuk GM, karena kanvas tidak dirender di fase ini). | Seluruh grup memiliki `status: "FINISHED"`. |
-| **`GUESSING`** | Grup yang sudah lewat (`idx < activeGuessGroupIndex`) terlihat oleh semua; grup yang sedang ditebak (`idx === activeGuessGroupIndex`) dan grup berikutnya masih `"???"` bagi pemain (terlihat oleh GM). | Dikirim **hanya untuk 1 grup yang sedang ditebak** (`idx === activeGuessGroupIndex`) pada saat fase dimulai / pindah grup. Saat tebakan masuk (`SUBMIT_GUESS`) atau ubah Clue, `strokes` di-omit (`strokesOmitted: true`). | Target grup yang ditebak ditentukan oleh `state.activeGuessGroupIndex`. Jika `state.clueActive === true`, grup tersebut memiliki `clueText` (misal `"K _ _ _ _ _"`). |
-| **`REVEAL`** | Kata rahasia grup `idx <= activeGuessGroupIndex` terbuka untuk seluruh pemain. | Dikirim **hanya untuk 1 grup yang sedang di-reveal** (`idx === activeGuessGroupIndex`). | `group.scoreBreakdown` dan `group.correctGuessers` berisi rincian poin gambar tersebut. |
-| **`LEADERBOARD`** | Terbuka untuk **semua grup** dan semua pemain. | Dikirim penuh untuk **semua grup** agar galeri karya semua kelompok dapat dirender. | `group.scoreBreakdown.roundTotal` dan `accumulatedTotal` terisi penuh untuk klasemen akhir. |
+| **`LOBBY`** | `"???"` untuk semua pemain (`""` bagi GM). | `[]` (atau `undefined` jika `strokesOmitted: true`). | `status: "WAITING"`, `currentTurnIndex: 0`, `activePlayerId` mengacu pada `members[0].id`. |
+| **`DRAWING`** | Terlihat **hanya** oleh anggota grup itu sendiri (`viewerGroupId === g.id`) dan `game_master`. Grup lain menerima `"???"`. | Saat `START_DRAWING_PHASE`: `[]`. Selama pergantian giliran (`PASS_TURN`, `GM_SKIP_MEMBER_TURN`, `COUNTDOWN` $\rightarrow$ `DRAWING`, habis waktu/tinta): di-omit (`strokesOmitted: true`) karena goresan dikirim via `STROKE_STREAM`. Saat balasan `IDENTIFY` (termasuk reconnect) / `GET /api/state`: dikirim penuh (`strokesOmitted: false`) **hanya** ke anggota grup itu sendiri (`viewerGroupId === g.id`) dan `game_master`. | `status` bernilai `"COUNTDOWN"` (3 detik awal tiap giliran) $\rightarrow$ `"DRAWING"` $\rightarrow$ `"FINISHED"`. `currentTurnIndex` menunjuk indeks `0..members.length-1`, `activePlayerId` berisi `members[g.currentTurnIndex].id`. |
+| **`READY_TO_GUESS`** | `"???"` untuk semua pemain; terlihat oleh `game_master`. | Di-omit (`strokesOmitted: true`) pada saat transisi dari `DRAWING`, atau `[]` pada `IDENTIFY`. | Seluruh grup memiliki `status: "FINISHED"`. |
+| **`GUESSING`** | Grup yang sudah lewat (`idx < activeGuessGroupIndex`) terlihat oleh semua; grup yang sedang ditebak (`idx === activeGuessGroupIndex`) dan grup berikutnya masih `"???"` bagi pemain (terlihat oleh GM). | Dikirim penuh (`strokesOmitted: false`) **hanya untuk 1 grup yang sedang ditebak** (`idx === activeGuessGroupIndex`) pada saat fase dimulai / pindah grup (`startGuessingForGroup`) dan balasan `IDENTIFY`. Saat tebakan masuk (`SUBMIT_GUESS`) atau ubah Clue, `strokes` di-omit (`strokesOmitted: true`). | Target grup yang ditebak ditentukan oleh `state.activeGuessGroupIndex`. Jika `state.clueActive === true`, grup tersebut memiliki `clueText` (misal `"K _ _ _ _ _"`). |
+| **`REVEAL`** | Kata rahasia grup `idx <= activeGuessGroupIndex` terbuka untuk seluruh pemain. | Dikirim penuh (`strokesOmitted: false`) **hanya untuk 1 grup yang sedang di-reveal** (`idx === activeGuessGroupIndex`). | `group.scoreBreakdown` dan `group.correctGuessers` berisi rincian poin gambar tersebut. |
+| **`LEADERBOARD`** | Terbuka untuk **semua grup** dan semua pemain. | Dikirim penuh (`strokesOmitted: false`) untuk **semua grup** agar galeri karya semua kelompok dapat dirender. | `group.scoreBreakdown.roundTotal` dan `accumulatedTotal` terisi penuh untuk klasemen akhir. |
 
 *(Catatan Privasi `state.guessFeed`: Di `server.js` baris `912–918`, setiap item pada `guessFeed` yang memiliki `item.isClose === true` difilter di server sehingga **hanya disertakan jika `viewer && item.playerId === viewer.id`**. Peserta lain sama sekali tidak menerima entri tebakan yang hampir benar tersebut).*
 
