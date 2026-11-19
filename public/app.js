@@ -1058,22 +1058,6 @@
                   <div id="groupInkBar-${myGroup.id}" class="ink-bar-fill group-ink" style="width:${myGroup.remainingInkPct}%;"></div>
                 </div>
               </div>
-
-              <div>
-                <div style="display:flex;justify-content:space-between;font-size:0.78rem;margin-bottom:4px;">
-                  <span>🖌️ Porsi Tinta Giliran Ini (${
-                    st.settings.passInkBehavior === "INHERITED"
-                      ? "Warisan Aktif"
-                      : st.settings.passInkBehavior === "WASTED"
-                      ? "Hangus Jika Pass"
-                      : "Porsi Tetap • Sisa Ditabung"
-                  })</span>
-                  <strong id="turnInkText-${myGroup.id}">${myGroup.turnInkRemaining} / ${myGroup.turnInkLimit} (${turnPct}%)</strong>
-                </div>
-                <div class="ink-bar-track">
-                  <div id="turnInkBar-${myGroup.id}" class="ink-bar-fill turn-ink ${turnPct < 20 ? "danger" : ""}" style="width:${turnPct}%;"></div>
-                </div>
-              </div>
             </div>
 
             <h4 style="font-size:0.82rem;color:var(--text-muted);margin:12px 0 8px;">Urutan Estafet ${escapeHtml(myGroup.name)}:</h4>
@@ -1158,6 +1142,23 @@
                   </div>`
                 : ""
             }
+          </div>
+
+          <!-- Bar Sisa Tinta Individu Peserta Tepat di Bawah Kanvas -->
+          <div style="margin-top:12px;padding:10px 12px;background:rgba(15,23,42,0.65);border-radius:var(--radius-md);border:1px solid var(--border-color);">
+            <div style="display:flex;justify-content:space-between;align-items:center;font-size:0.8rem;margin-bottom:6px;gap:8px;flex-wrap:wrap;">
+              <span>🖌️ Porsi Tinta Giliran Ini (${
+                st.settings.passInkBehavior === "INHERITED"
+                  ? "Warisan Aktif"
+                  : st.settings.passInkBehavior === "WASTED"
+                  ? "Hangus Jika Pass"
+                  : "Porsi Tetap • Sisa Ditabung"
+              })</span>
+              <strong id="turnInkText-${myGroup.id}">${myGroup.turnInkRemaining} / ${myGroup.turnInkLimit} (${turnPct}%)</strong>
+            </div>
+            <div class="ink-bar-track">
+              <div id="turnInkBar-${myGroup.id}" class="ink-bar-fill turn-ink ${turnPct < 20 ? "danger" : ""}" style="width:${turnPct}%;"></div>
+            </div>
           </div>
 
           <!-- Toolbar Warna, Penghapus & Ukuran Kuas (Tanpa Tombol Undo sesuai Blueprint) -->
